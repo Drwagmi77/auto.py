@@ -3,3 +3,5 @@ solana
 requests
 psycopg2-binary
 Flask[async]
+gunicorn==20.1.0
+gevent==21.12.0
