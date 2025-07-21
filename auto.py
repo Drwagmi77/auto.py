@@ -28,9 +28,11 @@ from solders.instruction import Instruction
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.rpc.responses import GetBalanceResp, GetBlockHeightResp
 from solders.hash import Hash
-from solders.signature import Signature
+from solders.signature import Signature # Sadece simülasyon veya hata ayıklama için kullanılabilir
 from solders.system_program import transfer
 from solders.transaction_status import TransactionConfirmationStatus
+from solders.transaction import MessageHeader, CompiledInstruction, Message
+from solders.address_lookup_table_account import AddressLookupTableAccount
 
 # --- Ortam Değişkenleri ---
 DB_NAME = os.environ.get("DB_NAME", "your_db_name")
@@ -49,45 +51,46 @@ SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
 JUPITER_API_URL = os.environ.get("JUPITER_API_URL", "https://quote-api.jup.ag/v6")
 
 SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(24).hex())
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "adminpassword") # Web paneli için şifre
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
-# --- Telethon İstemcileri ---
+# --- Telethon Clients ---
 bot_client = TelegramClient('auto_buy_bot_session', API_ID, API_HASH)
 
-# --- Solana İstemci ve Cüzdan Başlatma ---
+# --- Solana Client and Wallet Initialization ---
 solana_client = None
 payer_keypair = None
 
-# Denenecek RPC uç noktaları listesi (Helius RPC ile güncellendi)
+# List of RPC endpoints to try (updated with Helius RPC)
 RPC_ENDPOINTS = [
     "https://mainnet.helius-rpc.com/?api-key=7930dbab-e806-4f3f-bf3b-716a14c6e3c3", # Helius Mainnet RPC
-    "https://api.mainnet-beta.solana.com", # Yedek olarak genel RPC
+    "https://api.mainnet-beta.solana.com", # General RPC as fallback
     "https://solana-rpc.web3auth.io",
     "https://ssc-dao.genesysgo.net",
     "https://rpc.ankr.com/solana",
     "https://solana-mainnet.rpc.extrnode.com"
 ]
 
-# Aktif RPC URL'sini tutmak için global değişken
+# Global variable to hold the active RPC URL
 active_rpc_url = None
 
-# Jupiter API çağrıları için global kilit ve rate limit
+# Global lock and rate limit for Jupiter API calls
 jupiter_api_lock = asyncio.Lock()
 last_jupiter_call_time = 0
-JUPITER_RATE_LIMIT_DELAY = 2.0 # Her Jupiter API çağrısı arasında en az 2.0 saniye bekle (artırıldı)
+JUPITER_RATE_LIMIT_DELAY = 2.0 # Minimum delay between each Jupiter API call (increased)
 
-# Jupiter API çağrıları için Semaphore (eşzamanlı istekleri sınırlamak için)
-JUPITER_SEMAPHORE = asyncio.Semaphore(3) # Maksimum 3 eşzamanlı Jupiter API isteği
+# Semaphore for Jupiter API calls (to limit concurrent requests)
+JUPITER_SEMAPHORE = asyncio.Semaphore(3) # Maximum 3 concurrent Jupiter API requests
 
-# Jupiter teklifleri için cache (5 dakika TTL'li, 100 token sakla)
+# Cache for Jupiter quotes (with 5-minute TTL, store 100 tokens)
 QUOTE_CACHE = TTLCache(maxsize=100, ttl=300)
 
 async def get_healthy_client():
     """
-    Önceden tanımlanmış bir listeden sağlıklı bir Solana RPC uç noktasına bağlanmaya çalışır.
-    Başarılı olursa bir Client nesnesi, aksi takdirde None döndürür.
+    Attempts to connect to a healthy Solana RPC endpoint from a predefined list.
+    Returns a Client object on success, None otherwise.
     """
     global active_rpc_url
     for url in RPC_ENDPOINTS:
@@ -95,47 +98,46 @@ async def get_healthy_client():
             logger.info(f"RPC URL test ediliyor: {url}")
             client = Client(url)
             
-            # Sağlık kontrolü için get_block_height() kullanılıyor
-            # Bu, RPC'nin temel bir isteğe yanıt verip vermediğini kontrol eder.
+            # Use get_block_height() for a health check
             block_height_resp = await asyncio.to_thread(client.get_block_height)
             
-            # GetBlockHeightResp nesnesini ve değerini kontrol et
+            # Check the GetBlockHeightResp object and its value
             if isinstance(block_height_resp, GetBlockHeightResp) and block_height_resp.value is not None and block_height_resp.value > 0:
                 logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Blok yüksekliği: {block_height_resp.value}")
-                active_rpc_url = url # Aktif URL'yi kaydet
+                active_rpc_url = url # Save the active URL
                 return client
             else:
                 logger.warning(f"RPC {url} sağlıksız görünüyor veya geçersiz blok yüksekliği döndürdü: {block_height_resp}")
         except Exception as e:
             logger.warning(f"RPC {url} bağlantısı başarısız: {str(e)}")
     logger.error("Tüm RPC uç noktaları başarısız oldu.")
-    active_rpc_url = None # Sağlıklı RPC bulunamadı
+    active_rpc_url = None # No healthy RPC found
     return None
 
 async def get_balance_with_retry(pubkey: Pubkey, retries=3):
     """
-    Solana bakiyesini bir yeniden deneme mekanizmasıyla alır.
-    GetBalanceResp nesnesini işler.
+    Retrieves Solana balance with a retry mechanism.
+    Handles GetBalanceResp object.
     """
     for i in range(retries):
         try:
-            # commitment="confirmed" eklendi
+            # commitment="confirmed" added
             resp = await asyncio.to_thread(solana_client.get_balance, pubkey, commitment="confirmed")
             
-            # GetBalanceResp nesnesinin değerini doğrudan döndür
+            # Return the value directly from the GetBalanceResp object
             if isinstance(resp, GetBalanceResp):
                 return resp.value
             else:
                 logger.warning(f"get_balance için beklenmeyen yanıt türü: {type(resp)}. Tam yanıt: {resp}. Deneme {i+1}/{retries}")
         except Exception as e:
             logger.warning(f"Bakiye kontrol denemesi {i+1}/{retries} başarısız oldu: {e}")
-            await asyncio.sleep(1) # Yeniden denemeden önce kısa bir gecikme
+            await asyncio.sleep(1) # Short delay before retrying
     return None
 
 async def check_wallet_balance():
     """
-    Cüzdanın SOL bakiyesini kontrol eder ve SOL cinsinden döndürür.
-    Hata durumunda None döndürür.
+    Checks the wallet's SOL balance and returns it in SOL.
+    Returns None on error.
     """
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Bakiye kontrol edilemiyor.")
@@ -148,13 +150,13 @@ async def check_wallet_balance():
             logger.error("Cüzdan bakiyesi alınamadı.")
             return None
             
-        return balance_lamports / 10**9  # SOL cinsinden
+        return balance_lamports / 10**9  # In SOL
     except Exception as e:
         logger.error(f"Bakiye kontrol hatası: {str(e)}", exc_info=True)
         return None
 
 async def init_solana_client():
-    """Solana RPC istemcisini ve cüzdanı başlatır."""
+    """Initializes the Solana RPC client and wallet."""
     global solana_client, payer_keypair
 
     # Reset them at the start to ensure clean state for re-initialization
@@ -180,7 +182,7 @@ async def init_solana_client():
             logger.info(f"Cüzdan başlatıldı: {payer_keypair.pubkey()}")
             logger.info(f"Aktif RPC URL'si: {active_rpc_url if active_rpc_url else 'Bilinmiyor'}")
 
-            # Bakiye kontrolü (this can fail without invalidating the client/keypair)
+            # Balance check (this can fail without invalidating the client/keypair)
             balance = await check_wallet_balance()
             logger.info(f"Başlangıç bakiyesi: {balance if balance is not None else 'Alınamadı'} SOL")
 
@@ -196,9 +198,9 @@ async def init_solana_client():
         logger.error(f"Solana istemcisi başlatma hatası: {str(e)}", exc_info=True)
         # solana_client and payer_keypair are already None from the start or from inner except
 
-# --- Veritabanı Bağlantısı ve Yönetim Fonksiyonları (PostgreSQL) ---
+# --- Database Connection and Management Functions (PostgreSQL) ---
 def get_connection():
-    """Bir PostgreSQL veritabanı bağlantısı sağlar."""
+    """Provides a PostgreSQL database connection."""
     try:
         return psycopg2.connect(
             dbname=DB_NAME,
@@ -213,7 +215,7 @@ def get_connection():
         raise e
 
 def init_db_sync():
-    """Veritabanı tablolarını oluşturur (eğer yoksa)."""
+    """Creates database tables (if they don't exist)."""
     conn = None
     try:
         conn = get_connection()
@@ -355,7 +357,7 @@ def set_bot_setting_sync(setting, value):
             """, (setting, value, value))
         conn.commit()
         if cur.rowcount > 0:
-            # Özel anahtar ise maskele
+            # Mask private key for logging
             if setting == "SOLANA_PRIVATE_KEY" or setting == "JUPITER_API_KEY":
                 logger.info(f"Bot ayarı '{setting}' ayarlandı. Değer güvenlik için maskelendi.")
             else:
@@ -487,7 +489,7 @@ def get_transaction_history_sync():
         if conn:
             conn.close()
 
-# --- Asenkron Veritabanı Fonksiyonları Sarmalayıcıları ---
+# --- Asynchronous Database Function Wrappers ---
 async def init_db():
     await asyncio.to_thread(init_db_sync)
 
@@ -502,7 +504,7 @@ async def remove_admin(user_id):
 
 async def get_bot_setting(setting):
     val = await asyncio.to_thread(get_bot_setting_sync, setting)
-    # Eğer ayar veritabanında yoksa ve ortam değişkeni olarak ayarlanmışsa onu kullan
+    # If setting is not in DB and is set as environment variable, use it
     if val is None:
         if setting == "SOLANA_PRIVATE_KEY":
             return os.environ.get("SOLANA_PRIVATE_KEY")
@@ -534,21 +536,22 @@ async def add_transaction_history(*args):
 async def get_transaction_history():
     return await asyncio.to_thread(get_transaction_history_sync)
 
-# --- Varsayılan Ayarlar ---
+# --- Default Settings ---
 DEFAULT_ADMIN_ID = int(os.environ.get("DEFAULT_ADMIN_ID", "YOUR_TELEGRAM_USER_ID"))
 DEFAULT_BOT_SETTINGS = {
     "bot_status": "running",
     "auto_buy_enabled": "enabled",
     "buy_amount_sol": "0.05",
-    "slippage_tolerance": "5", # bps cinsinden %0.05
+    "slippage_tolerance": "5", # 5 = 0.5% (Jupiter uses BPS, 1 BPS = 0.01%)
     "auto_sell_enabled": "enabled",
     "profit_target_x": "5.0",
     "stop_loss_percent": "50.0",
     "SOLANA_PRIVATE_KEY": os.environ.get("SOLANA_PRIVATE_KEY", ""),
-    "JUPITER_API_KEY": os.environ.get("JUPITER_API_KEY", "") # Yeni Jupiter API Anahtarı ayarı
+    "JUPITER_API_KEY": os.environ.get("JUPITER_API_KEY", ""), # New Jupiter API Key setting
+    "DEFAULT_PRIORITY_FEE_LAMPORTS": "100000" # Default priority fee in micro-lamports (0.0001 SOL)
 }
 
-# --- Loglama Kurulumu ---
+# --- Logging Setup ---
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -561,9 +564,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("🔥 Otomatik Alım-Satım Botu Loglama kurulumu tamamlandı. Bot başlatılıyor...")
 
-# --- Telethon Yardımcı Fonksiyonları ---
+# --- Telethon Helper Functions ---
 async def retry_telethon_call(coro, max_retries=5, base_delay=1.0):
-    """Telethon çağrıları için yeniden deneme mekanizması."""
+    """Retry mechanism for Telethon calls."""
     for i in range(max_retries):
         try:
             return await coro
@@ -578,12 +581,12 @@ async def retry_telethon_call(coro, max_retries=5, base_delay=1.0):
     raise RuntimeError("Yeniden deneme mantığı başarısız oldu veya max_retries 0 idi")
 
 def extract_contract(text: str) -> str | None:
-    """Metinden Solana sözleşme adresini (Base58, 32-44 karakter) çıkarır."""
+    """Extracts Solana contract address (Base58, 32-44 characters) from text."""
     m = re.findall(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b", text)
     return m[0] if m else None
 
 def extract_token_name_from_message(text: str) -> str:
-    """Mesajdan token adını ($TOKEN_NAME formatında) çıkarır."""
+    """Extracts token name (in $TOKEN_NAME format) from message."""
     lines = text.strip().splitlines()
     if not lines:
         logger.debug("Token çıkarımı için boş mesaj alındı; 'unknown' döndürülüyor.")
@@ -597,18 +600,18 @@ def extract_token_name_from_message(text: str) -> str:
     logger.debug("Mesajda geçerli bir token ($WORD) bulunamadı; 'unknown' döndürülüyor.")
     return "unknown"
 
-# --- Solana Otomatik Alım Fonksiyonları ---
+# --- Solana Auto Buy/Sell Functions ---
 async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001, max_retries=7, initial_delay=3.0):
-    """Belirli bir token'ın mevcut SOL fiyatını tahmin eder, yeniden deneme ile."""
+    """Estimates the current SOL price of a specific token, with retries."""
     global last_jupiter_call_time
 
     if not solana_client:
         logger.error("Solana istemcisi başlatılmadı. Token fiyatı alınamıyor.")
         return None
 
-    async with JUPITER_SEMAPHORE: # Semaphore kullanımı
+    async with JUPITER_SEMAPHORE: # Use Semaphore
         async with jupiter_api_lock:
-            # Rate limit gecikmesini uygula
+            # Apply rate limit delay
             elapsed_time = time.time() - last_jupiter_call_time
             if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
                 await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
@@ -624,6 +627,7 @@ async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check
                     input_mint = token_mint
                     output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
 
+                    # Get token decimals
                     token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint)
                     if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
                         logger.warning(f"{token_mint_str} için token arz bilgisi alınamadı. Ondalık basamaklar belirlenemiyor.")
@@ -646,13 +650,13 @@ async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check
                     
                     price_sol_per_token = (float(quote_data['outAmount']) / (10**9)) / (float(quote_data['inAmount']) / (10**decimals))
                     logger.debug(f"{token_mint_str} için mevcut fiyat: {price_sol_per_token} SOL/token")
-                    last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
+                    last_jupiter_call_time = time.time() # Update successful call time
                     return price_sol_per_token
 
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"Jupiter'den token fiyatı alınırken hata (deneme {attempt+1}/{max_retries}): {e}")
                     if e.response is not None and e.response.status_code == 429:
-                        # 429 hatası durumunda daha uzun bekle ve yöneticiye bildir
+                        # On 429 error, wait longer and notify admin
                         delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
                         logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
                         await bot_client.send_message(
@@ -664,7 +668,7 @@ async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check
                         )
                         await asyncio.sleep(delay)
                     elif attempt < max_retries - 1:
-                        # Diğer istek hataları için varsayılan gecikme
+                        # Default delay for other request errors
                         await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
                     else:
                         logger.error(f"Jupiter'den token fiyatı alınırken maksimum yeniden deneme sayısına ulaşıldı: {e}")
@@ -672,12 +676,12 @@ async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check
                 except Exception as e:
                     logger.error(f"get_current_token_price_sol içinde beklenmeyen hata: {e}", exc_info=True)
                     return None
-            last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
+            last_jupiter_call_time = time.time() # Update time when retry loop finishes (even if failed)
     return None
 
 
 async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamports: int, slippage_bps: int, max_retries=7, initial_delay=3.0):
-    """Jupiter Aggregator'dan bir takas teklifi alır, yeniden deneme ile."""
+    """Retrieves a swap quote from Jupiter Aggregator, with retries."""
     global last_jupiter_call_time
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Teklif alınamıyor.")
@@ -688,9 +692,9 @@ async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamp
         logger.debug(f"Cache'ten teklif alındı: {cache_key}")
         return QUOTE_CACHE[cache_key]
 
-    async with JUPITER_SEMAPHORE: # Semaphore kullanımı
+    async with JUPITER_SEMAPHORE: # Use Semaphore
         async with jupiter_api_lock:
-            # Rate limit gecikmesini uygula
+            # Apply rate limit delay
             elapsed_time = time.time() - last_jupiter_call_time
             if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
                 await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
@@ -714,14 +718,14 @@ async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamp
                         continue
 
                     logger.info(f"Jupiter teklifi {input_mint}'ten {output_mint}'e alındı: {quote_data.get('outAmount')} {quote_data.get('outputToken', {}).get('symbol')}")
-                    last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
-                    QUOTE_CACHE[cache_key] = quote_data # Cache'e ekle
+                    last_jupiter_call_time = time.time() # Update successful call time
+                    QUOTE_CACHE[cache_key] = quote_data # Add to cache
                     return quote_data
 
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"Jupiter teklifi alınırken hata (deneme {attempt+1}/{max_retries}): {e}")
                     if e.response is not None and e.response.status_code == 429:
-                        # 429 hatası durumunda daha uzun bekle ve yöneticiye bildir
+                        # On 429 error, wait longer and notify admin
                         delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
                         logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
                         await bot_client.send_message(
@@ -733,7 +737,7 @@ async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamp
                         )
                         await asyncio.sleep(delay)
                     elif attempt < max_retries - 1:
-                        # Diğer istek hataları için varsayılan gecikme
+                        # Default delay for other request errors
                         await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
                     else:
                         logger.error(f"Jupiter teklifi alınırken maksimum yeniden deneme sayısına ulaşıldı: {e}")
@@ -741,19 +745,19 @@ async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamp
                 except Exception as e:
                     logger.error(f"get_swap_quote içinde beklenmeyen hata: {e}", exc_info=True)
                     return None
-            last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
+            last_jupiter_call_time = time.time() # Update time when retry loop finishes (even if failed)
     return None
 
 async def get_swap_transaction(quote_response: dict, payer_pubkey: Pubkey, max_retries=7, initial_delay=3.0):
-    """Jupiter Aggregator'dan takas işlemini alır, yeniden deneme ile."""
+    """Retrieves the swap transaction from Jupiter Aggregator, with retries."""
     global last_jupiter_call_time
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Takas işlemi alınamıyor.")
         return None
 
-    async with JUPITER_SEMAPHORE: # Semaphore kullanımı
+    async with JUPITER_SEMAPHORE: # Use Semaphore
         async with jupiter_api_lock:
-            # Rate limit gecikmesini uygula
+            # Apply rate limit delay
             elapsed_time = time.time() - last_jupiter_call_time
             if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
                 await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
@@ -771,7 +775,7 @@ async def get_swap_transaction(quote_response: dict, payer_pubkey: Pubkey, max_r
                         "userPublicKey": str(payer_pubkey),
                         "wrapUnwrapSOL": True,
                         "dynamicComputeUnitLimit": True,
-                        "prioritizationFeeLamports": "auto" # Otomatik önceliklendirme ücreti
+                        "prioritizationFeeLamports": "auto" # Auto prioritization fee
                     }
                     response = requests.post(swap_url, headers=headers, json=payload)
                     response.raise_for_status()
@@ -784,7 +788,7 @@ async def get_swap_transaction(quote_response: dict, payer_pubkey: Pubkey, max_r
                         continue
 
                     logger.info("Jupiter'den takas işlemi başarıyla alındı.")
-                    last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
+                    last_jupiter_call_time = time.time() # Update successful call time
                     return swap_data
 
                 except requests.exceptions.RequestException as e:
@@ -808,65 +812,131 @@ async def get_swap_transaction(quote_response: dict, payer_pubkey: Pubkey, max_r
                 except Exception as e:
                     logger.error(f"get_swap_transaction içinde beklenmeyen hata: {e}", exc_info=True)
                     return None
-            last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
+            last_jupiter_call_time = time.time() # Update time when retry loop finishes (even if failed)
     return None
 
-async def send_and_confirm_transaction(transaction_base64: str, max_retries=5, initial_delay=5.0):
+async def send_and_confirm_transaction(transaction_base64: str, priority_fee_lamports: int, max_retries=5, initial_delay=5.0):
     """
-    Serileştirilmiş bir işlemi Solana ağına gönderir ve onaylanmasını bekler.
+    Sends a serialized transaction to the Solana network and waits for confirmation.
+    Includes adding compute budget instructions for priority fees.
     """
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. İşlem gönderilemiyor.")
         return None, "Solana istemcisi başlatılmadı."
 
     try:
-        # Base64 string'i baytlara dönüştür
-        raw_transaction = base64.b64decode(transaction_base64)
+        # Decode the base64 string to bytes
+        raw_transaction_bytes = base64.b64decode(transaction_base64)
         
-        # İşlemi Keypair ile imzala
-        # `VersionedTransaction.from_bytes` kullanarak işlemi yeniden oluştur
-        # Bu kısım solders kütüphanesinin güncel versiyonuyla uyumlu olmalı.
-        # Jupiter'den gelen işlem genellikle zaten kısmen imzalı veya mesaj formatında olabilir.
-        # Burada sadece payer_keypair ile imzalama adımı simüle ediliyor veya tamamlanıyor.
+        # Deserialize the transaction. Jupiter usually returns a VersionedTransaction (V0)
+        # We need to parse it and potentially add our own instructions.
+        # Note: solders.transaction.VersionedTransaction.from_bytes() expects the full transaction,
+        # including signatures. Jupiter's swapTransaction is often a partially signed transaction
+        # or a message that needs to be wrapped.
         
-        # Eğer Jupiter'den gelen işlem doğrudan MessageV0 ise:
-        # message = MessageV0.from_bytes(raw_transaction)
-        # transaction = VersionedTransaction(message, [payer_keypair.sign_message(message.serialize())])
+        # More robust way to handle Jupiter's transaction:
+        # It's often a base64 encoded `VersionedTransaction` which is already partially signed by Jupiter.
+        # We need to deserialize it, add our compute budget instructions, and then sign it with our payer_keypair.
+        
+        # First, try to load as a VersionedTransaction
+        try:
+            transaction = VersionedTransaction.from_bytes(raw_transaction_bytes)
+        except Exception as e:
+            # If it fails, it might be just the message, or an older format.
+            # For simplicity, we assume it's a V0 message that needs wrapping or a full V0 tx.
+            # If Jupiter provides a direct message, you'd do:
+            # message = MessageV0.from_bytes(raw_transaction_bytes)
+            # transaction = VersionedTransaction(message, []) # Signatures will be added later
+            logger.error(f"Jupiter'dan alınan işlemi ayrıştırırken hata: {e}. Ham işlem: {raw_transaction_bytes[:100]}...")
+            return None, f"İşlem ayrıştırma hatası: {e}"
 
-        # Eğer Jupiter'den gelen işlem zaten bir VersionedTransaction ise:
-        # transaction = VersionedTransaction.from_bytes(raw_transaction)
-        # transaction.sign([payer_keypair]) # Bu metot olmayabilir, Solders'ın nasıl çalıştığına bakılmalı.
+        # Add Compute Budget instructions for priority fees
+        # These instructions must be added before signing.
+        compute_unit_limit_instruction = set_compute_unit_limit(1_000_000) # Example limit, adjust as needed
+        compute_unit_price_instruction = set_compute_unit_price(priority_fee_lamports)
         
-        # Basit bir imzalama simülasyonu veya Jupiter'in döndürdüğü formatı kullanarak:
-        # Genellikle Jupiter, kısmen imzalı bir işlem döndürür, bizim sadece kendi cüzdanımızla imzalamamız gerekir.
-        # Burada `raw_transaction`'ın doğrudan gönderilebilecek bir formatta olduğunu varsayıyoruz
-        # ve sadece RPC çağrısını simüle ediyoruz.
+        # Create a new message with added instructions.
+        # This is a common pattern when modifying transactions from external sources.
+        # You might need to re-compile the message if you add instructions.
+        # For VersionedTransaction, you typically modify the instructions list directly if it's mutable,
+        # or rebuild the message from scratch.
         
-        # Gerçek kullanımda:
-        # transaction = VersionedTransaction.from_bytes(raw_transaction)
-        # transaction.sign([payer_keypair])
-        # signature = await asyncio.to_thread(solana_client.send_transaction, transaction)
-        # logger.info(f"İşlem gönderildi, imza: {signature}")
-        # await asyncio.to_thread(solana_client.confirm_transaction, signature, commitment="confirmed")
+        # Simplistic approach: Assuming the transaction's message instructions are mutable or can be replaced.
+        # A more correct way for VersionedTransaction might involve rebuilding MessageV0.
+        # For now, we'll try to insert them directly.
+        # Note: The exact placement of these instructions can matter for transaction efficiency.
+        # Usually, they are placed at the beginning.
+        
+        # Rebuilding the message for VersionedTransaction (V0)
+        # This is a more robust way to add instructions to a VersionedTransaction
+        # Get existing instructions and accounts from the transaction's message
+        current_instructions = list(transaction.message.instructions)
+        current_static_accounts = list(transaction.message.static_account_keys)
+        current_address_table_lookups = transaction.message.address_table_lookups
 
-        # Simülasyon:
-        signature = Signature.new_unique() # Sahte bir imza oluştur
-        logger.info(f"İşlem gönderiliyor (simülasyon), imza: {signature}")
+        # Prepend compute budget instructions
+        new_instructions = [
+            CompiledInstruction(
+                program_id_index=current_static_accounts.index(Pubkey.from_string("ComputeBudget111111111111111111111111111111")),
+                accounts=[],
+                data=compute_unit_limit_instruction.data
+            ),
+            CompiledInstruction(
+                program_id_index=current_static_accounts.index(Pubkey.from_string("ComputeBudget111111111111111111111111111111")),
+                accounts=[],
+                data=compute_unit_price_instruction.data
+            )
+        ] + current_instructions
         
+        # Rebuild the message
+        new_message = MessageV0(
+            header=transaction.message.header,
+            static_account_keys=current_static_accounts,
+            recent_blockhash=transaction.message.recent_blockhash,
+            compiled_instructions=new_instructions,
+            address_table_lookups=current_address_table_lookups
+        )
+        
+        # Create a new VersionedTransaction with the modified message
+        transaction_to_send = VersionedTransaction(new_message, []) # Signatures will be added by sign()
+        
+        # Sign the transaction with our payer_keypair
+        transaction_to_send.sign([payer_keypair])
+        
+        # Get the latest blockhash before sending for better reliability
+        recent_blockhash_resp = await asyncio.to_thread(solana_client.get_latest_blockhash)
+        if not recent_blockhash_resp or not recent_blockhash_resp.value:
+            raise Exception("Son blok hash'i alınamadı.")
+        
+        transaction_to_send.message.recent_blockhash = Hash.from_string(recent_blockhash_resp.value.blockhash)
+
+        signature = None
         for i in range(max_retries):
             try:
-                # Gerçekte: await asyncio.to_thread(solana_client.send_raw_transaction, raw_transaction)
-                # Simülasyon:
-                await asyncio.sleep(random.uniform(1.0, 3.0)) # Gönderme süresi
+                # Send the raw, signed transaction
+                tx_signature = await asyncio.to_thread(
+                    solana_client.send_raw_transaction,
+                    transaction_to_send.serialize(), # Serialize the VersionedTransaction
+                    opts=TxOpts(skip_preflight=False) # skip_preflight=False for better error reporting
+                )
+                signature = tx_signature
+                logger.info(f"İşlem gönderildi, imza: {signature}")
+
+                # Wait for confirmation
+                confirmation = await asyncio.to_thread(
+                    solana_client.confirm_transaction,
+                    signature,
+                    commitment="confirmed" # Or "finalized" for higher certainty
+                )
                 
-                # Gerçekte: confirmation = await asyncio.to_thread(solana_client.confirm_transaction, signature, commitment="confirmed")
-                # Simülasyon:
-                if random.random() < 0.1 and i < max_retries - 1: # %10 ihtimalle geçici hata
-                    raise RPCException("Simulated temporary RPC error during confirmation")
-                
-                # Başarılı onay simülasyonu
-                logger.info(f"İşlem {signature} onaylandı (simülasyon).")
-                return str(signature), "success"
+                # Check confirmation status
+                if confirmation.value and confirmation.value[0].err:
+                    error_detail = confirmation.value[0].err
+                    logger.error(f"İşlem hatayla başarısız oldu: {error_detail}")
+                    return None, f"İşlem başarısız oldu: {error_detail}"
+                else:
+                    logger.info(f"İşlem onaylandı: {signature}")
+                    return str(signature), "success"
             except RPCException as e:
                 logger.warning(f"İşlem gönderme/onaylama denemesi {i+1}/{max_retries} başarısız: {e}")
                 if i < max_retries - 1:
@@ -884,7 +954,7 @@ async def send_and_confirm_transaction(transaction_base64: str, max_retries=5, i
 
 async def auto_buy_token(contract_address: str, token_name: str):
     """
-    Belirtilen sözleşme adresi için otomatik token alımını gerçekleştirir.
+    Performs automated token purchase for the specified contract address.
     """
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Otomatik alım yapılamıyor.")
@@ -900,6 +970,11 @@ async def auto_buy_token(contract_address: str, token_name: str):
         logger.info(f"Sözleşme {contract_address} zaten işlenmiş, atlanıyor.")
         return
 
+    bot_status = await get_bot_setting("bot_status")
+    if bot_status != "running":
+        logger.info(f"Bot duraklatıldı/durduruldu. Otomatik alım atlanıyor. Bot durumu: {bot_status}")
+        return
+
     auto_buy_enabled = await get_bot_setting("auto_buy_enabled")
     if auto_buy_enabled != "enabled":
         logger.info("Otomatik alım devre dışı bırakıldı.")
@@ -909,18 +984,21 @@ async def auto_buy_token(contract_address: str, token_name: str):
     slippage_tolerance_str = await get_bot_setting("slippage_tolerance")
     profit_target_x_str = await get_bot_setting("profit_target_x")
     stop_loss_percent_str = await get_bot_setting("stop_loss_percent")
+    priority_fee_lamports_str = await get_bot_setting("DEFAULT_PRIORITY_FEE_LAMPORTS")
 
     try:
         buy_amount_sol = float(buy_amount_sol_str)
-        slippage_bps = int(float(slippage_tolerance_str) * 100) # %'den bps'ye
+        # Jupiter uses BPS (Basis Points), where 1 BPS = 0.01%. So 5% slippage is 500 BPS.
+        slippage_bps = int(float(slippage_tolerance_str) * 100) 
         profit_target_x = float(profit_target_x_str)
         stop_loss_percent = float(stop_loss_percent_str)
+        priority_fee_lamports = int(priority_fee_lamports_str)
     except ValueError:
         logger.error("Geçersiz bot ayarları (sayısal değerler). Otomatik alım iptal edildi.")
         await bot_client.send_message(
             DEFAULT_ADMIN_ID,
             "❌ **Otomatik Alım Başarısız!**\n"
-            "Bot ayarları (alım miktarı, slippage, kar hedefi, stop loss) geçersiz. Lütfen `/settings` ile kontrol edin.",
+            "Bot ayarları (alım miktarı, slippage, kar hedefi, stop loss, öncelik ücreti) geçersiz. Lütfen `/settings` ile kontrol edin.",
             parse_mode='md'
         )
         return
@@ -936,11 +1014,16 @@ async def auto_buy_token(contract_address: str, token_name: str):
     )
 
     try:
-        # SOL'den token'a takas teklifi al
+        # Check wallet balance
+        current_balance = await check_wallet_balance()
+        if current_balance is None or current_balance < buy_amount_sol:
+            raise Exception(f"Yetersiz SOL bakiyesi. Gerekli: {buy_amount_sol} SOL, Mevcut: {current_balance if current_balance is not None else 'N/A'} SOL.")
+
+        # Get swap quote from SOL to token
         sol_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
         token_mint = Pubkey.from_string(contract_address)
         
-        # SOL miktarını lamports'a çevir
+        # Convert SOL amount to lamports
         amount_in_lamports = int(buy_amount_sol * (10**9))
 
         quote = await get_swap_quote(sol_mint, token_mint, amount_in_lamports, slippage_bps)
@@ -948,41 +1031,37 @@ async def auto_buy_token(contract_address: str, token_name: str):
         if not quote:
             raise Exception("Jupiter'den takas teklifi alınamadı.")
 
-        # Takas işlemini al
+        # Get swap transaction from Jupiter
         swap_transaction_data = await get_swap_transaction(quote, payer_keypair.pubkey())
 
         if not swap_transaction_data or "swapTransaction" not in swap_transaction_data:
             raise Exception("Jupiter'den takas işlemi alınamadı.")
 
-        # İşlemi gönder ve onayla
-        tx_signature, tx_status = await send_and_confirm_transaction(swap_transaction_data["swapTransaction"])
+        # Send and confirm the transaction
+        tx_signature, tx_status_msg = await send_and_confirm_transaction(
+            swap_transaction_data["swapTransaction"],
+            priority_fee_lamports
+        )
 
-        if tx_status != "success" or not tx_signature:
-            raise Exception(f"İşlem gönderilemedi veya onaylanamadı: {tx_status}")
+        if tx_status_msg != "success" or not tx_signature:
+            raise Exception(f"İşlem gönderilemedi veya onaylanamadı: {tx_status_msg}")
 
-        # Alınan token miktarını hesapla (yaklaşık olarak)
-        # Jupiter'den gelen outAmount'ı kullanarak daha doğru bir değer elde edebiliriz
-        # outAmount, teklif sırasında alınacak tahmini token miktarıdır.
-        # Bu miktar, token'ın ondalık basamaklarına göre düzeltilmelidir.
+        # Calculate received token amount and actual buy price
         token_info = await asyncio.to_thread(solana_client.get_token_supply, token_mint)
         token_decimals = token_info.value.decimals if token_info and token_info.value else 0
         
-        # outAmount lamports cinsinden, token_decimals'a bölerek gerçek token miktarını bul
         received_token_amount = float(quote['outAmount']) / (10**token_decimals)
         
-        # Ortalama alım fiyatını hesapla (SOL/token)
-        # Bu, harcanan SOL miktarı / alınan token miktarı olacaktır.
-        # Eğer quote'da inAmount ve outAmount varsa, bunları kullanmak daha doğru olur.
-        # quote['inAmount'] SOL'ün lamports cinsinden miktarıdır.
-        # quote['outAmount'] token'ın lamports cinsinden miktarıdır.
+        # Actual buy price (SOL/token) = (SOL spent in lamports / 10^9) / (token received in lamports / 10^decimals)
+        # Using quote's inAmount and outAmount for more accuracy
         actual_buy_price_sol_per_token = (float(quote['inAmount']) / (10**9)) / (float(quote['outAmount']) / (10**token_decimals))
 
 
         await add_open_position(
             contract_address,
             token_name,
-            actual_buy_price_sol_per_token, # Alım fiyatı SOL/token
-            received_token_amount, # Alınan token miktarı
+            actual_buy_price_sol_per_token, # Buy price SOL/token
+            received_token_amount, # Amount of token bought
             tx_signature,
             profit_target_x,
             stop_loss_percent
@@ -993,9 +1072,9 @@ async def auto_buy_token(contract_address: str, token_name: str):
             "BUY",
             token_name,
             contract_address,
-            buy_amount_sol, # Harcanan SOL
-            received_token_amount, # Alınan token
-            actual_buy_price_sol_per_token, # SOL/token fiyatı
+            buy_amount_sol, # SOL spent
+            received_token_amount, # Token received
+            actual_buy_price_sol_per_token, # Price SOL/token
             "SUCCESS"
         )
 
@@ -1017,7 +1096,7 @@ async def auto_buy_token(contract_address: str, token_name: str):
         error_msg = f"Otomatik alım {token_name} ({contract_address}) için başarısız oldu: {e}"
         logger.error(error_msg, exc_info=True)
         await add_transaction_history(
-            "N/A", # Başarısız işlemler için imza olmayabilir
+            "N/A", # No signature for failed transactions
             "BUY",
             token_name,
             contract_address,
@@ -1038,7 +1117,7 @@ async def auto_buy_token(contract_address: str, token_name: str):
 
 async def auto_sell_token(contract_address: str, token_name: str, sell_reason: str, position_data: dict):
     """
-    Belirtilen sözleşme adresi için otomatik token satışını gerçekleştirir.
+    Performs automated token sale for the specified contract address.
     """
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Otomatik satış yapılamıyor.")
@@ -1066,15 +1145,28 @@ async def auto_sell_token(contract_address: str, token_name: str, sell_reason: s
         parse_mode='md'
     )
 
+    priority_fee_lamports_str = await get_bot_setting("DEFAULT_PRIORITY_FEE_LAMPORTS")
     try:
-        # Token'dan SOL'a takas teklifi al
+        priority_fee_lamports = int(priority_fee_lamports_str)
+    except ValueError:
+        logger.error("Geçersiz öncelik ücreti ayarı. Otomatik satış iptal edildi.")
+        await bot_client.send_message(
+            DEFAULT_ADMIN_ID,
+            "❌ **Otomatik Satış Başarısız!**\n"
+            "Bot ayarlarındaki öncelik ücreti geçersiz. Lütfen `/settings` ile kontrol edin.",
+            parse_mode='md'
+        )
+        return
+
+    try:
+        # Get swap quote from token to SOL
         token_mint = Pubkey.from_string(contract_address)
         sol_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
         
-        # Satılacak token miktarını al (açık pozisyondan)
+        # Amount of token to sell (from open position)
         amount_to_sell_token = position_data['buy_amount_token']
 
-        # Token'ın ondalık basamaklarını al
+        # Get token decimals
         token_info = await asyncio.to_thread(solana_client.get_token_supply, token_mint)
         token_decimals = token_info.value.decimals if token_info and token_info.value else 0
         amount_in_lamports = int(amount_to_sell_token * (10**token_decimals))
@@ -1087,39 +1179,41 @@ async def auto_sell_token(contract_address: str, token_name: str, sell_reason: s
         if not quote:
             raise Exception("Jupiter'den takas teklifi alınamadı.")
 
-        # Takas işlemini al
+        # Get swap transaction from Jupiter
         swap_transaction_data = await get_swap_transaction(quote, payer_keypair.pubkey())
 
         if not swap_transaction_data or "swapTransaction" not in swap_transaction_data:
             raise Exception("Jupiter'den takas işlemi alınamadı.")
 
-        # İşlemi gönder ve onayla
-        tx_signature, tx_status = await send_and_confirm_transaction(swap_transaction_data["swapTransaction"])
+        # Send and confirm the transaction
+        tx_signature, tx_status_msg = await send_and_confirm_transaction(
+            swap_transaction_data["swapTransaction"],
+            priority_fee_lamports
+        )
 
-        if tx_status != "success" or not tx_signature:
-            raise Exception(f"İşlem gönderilemedi veya onaylanamadı: {tx_status}")
+        if tx_status_msg != "success" or not tx_signature:
+            raise Exception(f"İşlem gönderilemedi veya onaylanamadı: {tx_status_msg}")
 
-        # Alınan SOL miktarını hesapla (yaklaşık olarak)
+        # Calculate received SOL amount and actual sell price
         received_sol_amount = float(quote['outAmount']) / (10**9)
         
-        # Ortalama satış fiyatını hesapla (SOL/token)
         actual_sell_price_sol_per_token = (float(quote['outAmount']) / (10**9)) / (float(quote['inAmount']) / (10**token_decimals))
 
-        # Pozisyonu veritabanından kaldır
+        # Remove position from database
         await remove_open_position(contract_address)
         await add_transaction_history(
             tx_signature,
             "SELL",
             token_name,
             contract_address,
-            received_sol_amount, # Alınan SOL
-            amount_to_sell_token, # Satılan token
-            actual_sell_price_sol_per_token, # SOL/token fiyatı
+            received_sol_amount, # SOL received
+            amount_to_sell_token, # Token sold
+            actual_sell_price_sol_per_token, # Price SOL/token
             "SUCCESS"
         )
 
         profit_loss_sol = received_sol_amount - (position_data['buy_amount_token'] * position_data['buy_price_sol'])
-        profit_loss_percent = (profit_loss_sol / (position_data['buy_amount_token'] * position_data['buy_price_sol'])) * 100
+        profit_loss_percent = (profit_loss_sol / (position_data['buy_amount_token'] * position_data['buy_price_sol'])) * 100 if (position_data['buy_amount_token'] * position_data['buy_price_sol']) != 0 else 0
 
         await bot_client.send_message(
             DEFAULT_ADMIN_ID,
@@ -1158,7 +1252,7 @@ async def auto_sell_token(contract_address: str, token_name: str, sell_reason: s
             parse_mode='md'
         )
 
-# --- Telegram Bot Komutları ---
+# --- Telegram Bot Commands ---
 @bot_client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     admins = await get_admins()
@@ -1205,7 +1299,7 @@ async def admin_handler(event):
     if action == "add" and len(args) == 3:
         try:
             user_id = int(args[2])
-            # Kullanıcının adını almak için bir deneme yap
+            # Try to get user's name
             try:
                 user = await bot_client.get_entity(user_id)
                 first_name = user.first_name if user.first_name else "Bilinmeyen"
@@ -1238,16 +1332,16 @@ async def settings_handler(event):
         await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
         return
 
-    args = event.text.split(maxsplit=2) # Sadece 2 parçaya ayır: /settings, key, value
+    args = event.text.split(maxsplit=2) # Split into at most 2 parts: /settings, key, value
 
-    if len(args) == 1: # Ayarları göster
+    if len(args) == 1: # Show settings
         settings = {}
         for key in DEFAULT_BOT_SETTINGS.keys():
             value = await get_bot_setting(key)
             if key == "SOLANA_PRIVATE_KEY" and value:
-                settings[key] = value[:5] + "..." + value[-5:] # Maskele
+                settings[key] = value[:5] + "..." + value[-5:] # Mask
             elif key == "JUPITER_API_KEY" and value:
-                settings[key] = value[:5] + "..." + value[-5:] # Maskele
+                settings[key] = value[:5] + "..." + value[-5:] # Mask
             else:
                 settings[key] = value if value is not None else "AYARLANMADI"
 
@@ -1257,7 +1351,7 @@ async def settings_handler(event):
         settings_msg += "\nAyarları değiştirmek için:\n`/settings <anahtar> <değer>`"
         await event.reply(settings_msg, parse_mode='md')
 
-    elif len(args) == 3: # Ayarı değiştir
+    elif len(args) == 3: # Change setting
         setting_key = args[1].strip()
         setting_value = args[2].strip()
 
@@ -1269,10 +1363,10 @@ async def settings_handler(event):
             await event.reply("Geçersiz Solana özel anahtarı formatı. Base58 string olmalı.")
             return
         
-        # Sayısal değerler için doğrulama
-        if setting_key in ["buy_amount_sol", "slippage_tolerance", "profit_target_x", "stop_loss_percent"]:
+        # Validation for numerical values
+        if setting_key in ["buy_amount_sol", "slippage_tolerance", "profit_target_x", "stop_loss_percent", "DEFAULT_PRIORITY_FEE_LAMPORTS"]:
             try:
-                float(setting_value)
+                float(setting_value) # Use float for all numerical settings
             except ValueError:
                 await event.reply(f"`{setting_key}` için geçerli bir sayısal değer girin.")
                 return
@@ -1280,7 +1374,7 @@ async def settings_handler(event):
         await set_bot_setting(setting_key, setting_value)
         if setting_key == "SOLANA_PRIVATE_KEY" or setting_key == "JUPITER_API_KEY":
             await event.reply(f"Ayar `{setting_key}` başarıyla güncellendi (güvenlik için maskelendi).")
-            # Özel anahtar değiştiyse Solana istemcisini yeniden başlat
+            # If private key changed, re-initialize Solana client
             if setting_key == "SOLANA_PRIVATE_KEY":
                 await init_solana_client()
                 await event.reply("Solana istemcisi özel anahtar değişikliği nedeniyle yeniden başlatıldı.")
@@ -1310,6 +1404,7 @@ async def status_handler(event):
     status_msg += f"• Cüzdan Adresi: `{wallet_address}`\n"
     status_msg += f"• SOL Bakiyesi: `{balance:.4f} SOL`" if balance is not None else "• SOL Bakiyesi: `Alınamadı`\n"
     status_msg += f"• Aktif RPC: `{active_rpc_url if active_rpc_url else 'Bilinmiyor'}`\n"
+    status_msg += f"• Varsayılan Öncelik Ücreti: `{await get_bot_setting('DEFAULT_PRIORITY_FEE_LAMPORTS')} Lamports`\n"
     
     await event.reply(status_msg, parse_mode='md')
 
@@ -1353,12 +1448,15 @@ async def history_handler(event):
     history_msg = "**Son İşlem Geçmişi (Son 20 İşlem):**\n\n"
     for tx in history:
         tx_time = datetime.fromtimestamp(tx['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+        tx_sig_short = tx['tx_signature'][:6] + "..." + tx['tx_signature'][-4:] if tx['tx_signature'] and tx['tx_signature'] != "N/A" else "N/A"
+        contract_addr_short = tx['contract_address'][:6] + "..." + tx['contract_address'][-4:] if tx['contract_address'] else "N/A"
+        
         history_msg += (
             f"• Tür: **{tx['type']}** | Durum: **{tx['status']}**\n"
-            f"  Token: **{tx['token_name']}** (`{tx['contract_address'][:6]}...{tx['contract_address'][-4:]}`)\n"
+            f"  Token: **{tx['token_name']}** (`{contract_addr_short}`)\n"
             f"  SOL Miktarı: `{tx['amount_sol']:.4f}` | Token Miktarı: `{tx['amount_token']:.4f}`\n"
-            f"  Fiyat: `{tx['price_sol_per_token']:.8f} SOL/token`\n"
-            f"  TX ID: [`{tx['tx_signature'][:6]}...{tx['tx_signature'][-4:]}`](https://solscan.io/tx/{tx['tx_signature']})\n"
+            f"  Fiyat: `{tx['price_sol_per_token']:.8f}` SOL/token\n"
+            f"  TX ID: [`{tx_sig_short}`](https://solscan.io/tx/{tx['tx_signature']})\n"
             f"  Zaman: `{tx_time}`\n"
         )
         if tx['error_message']:
@@ -1393,11 +1491,21 @@ async def manual_buy_handler(event):
         await event.reply("Geçersiz token adresi formatı.")
         return
 
-    # Manuel alım için token adını "manuel_alım" olarak varsayalım veya bir yerden alalım
-    token_name = "Manuel Token" # Gerçek bir isim almak için başka bir API çağrısı gerekebilir
+    # For manual buy, try to fetch token name if possible, otherwise use a placeholder
+    token_name_from_api = "Manuel Token"
+    try:
+        token_mint_pubkey = Pubkey.from_string(token_address)
+        token_meta = await asyncio.to_thread(solana_client.get_token_supply, token_mint_pubkey)
+        if token_meta and token_meta.value and token_meta.value.ui_amount_string: # This field might contain symbol
+             # This is a heuristic, actual token symbol might need more specific API call (e.g., from token list)
+            token_name_from_api = token_meta.value.ui_amount_string.split(" ")[-1] if " " in token_meta.value.ui_amount_string else token_address[:4]
+            # A better way would be to query a token list like Jupiter's or Solana's
+            # For simplicity, we'll just use a placeholder or try to extract from UI amount string
+    except Exception as e:
+        logger.warning(f"Token {token_address} için isim alınamadı: {e}")
 
     await event.reply(f"Manuel alım başlatılıyor: {sol_amount} SOL karşılığında {token_address} tokenı...")
-    await auto_buy_token(token_address, token_name)
+    await auto_buy_token(token_address, token_name_from_api)
     await event.reply("Manuel alım işlemi tamamlandı (yukarıdaki mesajları kontrol edin).")
 
 @bot_client.on(events.NewMessage(pattern='/sell'))
@@ -1425,7 +1533,7 @@ async def manual_sell_handler(event):
         await event.reply(f"Açık pozisyonlarda {token_address} tokenı bulunamadı.")
         return
     
-    # Manuel satış için token adını pozisyondan alalım
+    # Get token name from position data
     token_name = position_to_sell['token_name']
 
     await event.reply(f"Manuel satış başlatılıyor: {token_name} ({token_address})...")
@@ -1454,7 +1562,7 @@ async def reinit_solana_handler(event):
         await event.reply("❌ Solana istemcisinin yeniden başlatılması başarısız oldu. Logları kontrol edin.")
 
 
-# --- Telegram Kanalı Dinleyicisi ---
+# --- Telegram Channel Listener (for sniping signals) ---
 @bot_client.on(events.NewMessage(chats=SOURCE_CHANNEL_ID))
 async def channel_message_handler(event):
     logger.info(f"Kanal {SOURCE_CHANNEL_ID} adresinden yeni mesaj alındı.")
@@ -1471,17 +1579,17 @@ async def channel_message_handler(event):
 
         bot_status = await get_bot_setting("bot_status")
         if bot_status == "running":
-            # Otomatik alım işlemini arka planda başlat
+            # Start auto buy operation in background
             asyncio.create_task(auto_buy_token(contract_address, token_name))
         else:
             logger.info("Bot duraklatıldı, otomatik alım tetiklenmedi.")
     else:
         logger.debug("Mesajda sözleşme adresi bulunamadı.")
 
-# --- Açık Pozisyonları İzleme Görevi ---
+# --- Monitor Open Positions Task ---
 async def monitor_open_positions():
     """
-    Açık pozisyonları periyodik olarak kontrol eder ve kar/zarar hedeflerine göre satış yapar.
+    Periodically checks open positions and performs sales based on profit/loss targets.
     """
     await bot_client.send_message(DEFAULT_ADMIN_ID, "📊 **Pozisyon İzleyici Başlatıldı.**")
     while True:
@@ -1489,13 +1597,13 @@ async def monitor_open_positions():
             auto_sell_enabled = await get_bot_setting("auto_sell_enabled")
             if auto_sell_enabled != "enabled":
                 logger.info("Otomatik satış devre dışı, pozisyon izleme duraklatıldı.")
-                await asyncio.sleep(60) # Daha uzun bekle
+                await asyncio.sleep(60) # Wait longer
                 continue
 
             positions = await get_open_positions()
             if not positions:
                 logger.debug("İzlenecek açık pozisyon yok.")
-                await asyncio.sleep(30) # Daha sık kontrol etmeye gerek yok
+                await asyncio.sleep(30) # No need to check too frequently
                 continue
 
             for pos in positions:
@@ -1511,7 +1619,7 @@ async def monitor_open_positions():
                     logger.warning(f"{token_name} ({contract_address}) için mevcut fiyat alınamadı. Atlanıyor.")
                     continue
 
-                # Kar/Zarar hesaplaması
+                # Calculate Profit/Loss
                 current_value_sol = pos['buy_amount_token'] * current_price_sol_per_token
                 initial_cost_sol = pos['buy_amount_token'] * buy_price_sol
                 
@@ -1520,16 +1628,16 @@ async def monitor_open_positions():
 
                 logger.info(f"Pozisyon {token_name}: Mevcut Fiyat: {current_price_sol_per_token:.8f} SOL/token, Kar/Zarar: {profit_loss_percent:.2f}%")
 
-                # Kar Hedefi Kontrolü
+                # Profit Target Check
                 if current_price_sol_per_token >= (buy_price_sol * target_profit_x):
                     logger.info(f"Kar hedefi {target_profit_x}x ulaşıldı! {token_name} satılıyor.")
                     asyncio.create_task(auto_sell_token(contract_address, token_name, "Kar Hedefi Ulaşıldı", pos))
-                # Stop Loss Kontrolü (negatif yüzde olarak)
+                # Stop Loss Check (as negative percentage)
                 elif profit_loss_percent <= -abs(stop_loss_percent):
                     logger.info(f"Stop loss {stop_loss_percent}% tetiklendi! {token_name} satılıyor.")
                     asyncio.create_task(auto_sell_token(contract_address, token_name, "Stop Loss Tetiklendi", pos))
             
-            await asyncio.sleep(30) # Her 30 saniyede bir kontrol et
+            await asyncio.sleep(30) # Check every 30 seconds
         except Exception as e:
             logger.error(f"Pozisyon izleme sırasında hata: {e}", exc_info=True)
             await bot_client.send_message(
@@ -1539,13 +1647,13 @@ async def monitor_open_positions():
                 "İzleyici devam edecek.",
                 parse_mode='md'
             )
-            await asyncio.sleep(60) # Hata durumunda daha uzun bekle
+            await asyncio.sleep(60) # Wait longer on error
 
-# --- Flask Web Arayüzü ---
+# --- Flask Web Server ---
 @app.route('/')
 def index():
     if 'logged_in' not in session:
-        return redirect('/login')
+        return redirect(url_for('login'))
     
     return render_template_string("""
     <!DOCTYPE html>
@@ -1591,14 +1699,14 @@ def index():
             </h1>
 
             <div class="grid md:grid-cols-2 gap-8">
-                <!-- Bot Durumu -->
+                <!-- Bot Status -->
                 <div class="card p-6">
                     <h2 class="text-2xl font-bold mb-4 text-purple-200">Bot Durumu</h2>
                     <div id="bot-status-content">Yükleniyor...</div>
                     <button onclick="fetchStatus()" class="btn-primary mt-4 w-full">Durumu Yenile</button>
                 </div>
 
-                <!-- Ayarlar -->
+                <!-- Settings -->
                 <div class="card p-6">
                     <h2 class="text-2xl font-bold mb-4 text-purple-200">Ayarlar</h2>
                     <div id="settings-content">Yükleniyor...</div>
@@ -1606,14 +1714,14 @@ def index():
                 </div>
             </div>
 
-            <!-- Açık Pozisyonlar -->
+            <!-- Open Positions -->
             <div class="card p-6">
                 <h2 class="text-2xl font-bold mb-4 text-purple-200">Açık Pozisyonlar</h2>
                 <div id="positions-content">Yükleniyor...</div>
                 <button onclick="fetchPositions()" class="btn-primary mt-4 w-full">Pozisyonları Yenile</button>
             </div>
 
-            <!-- İşlem Geçmişi -->
+            <!-- Transaction History -->
             <div class="card p-6">
                 <h2 class="text-2xl font-bold mb-4 text-purple-200">İşlem Geçmişi</h2>
                 <div id="history-content">Yükleniyor...</div>
@@ -1655,6 +1763,7 @@ def index():
                     html += `<p><span class="font-semibold">Cüzdan Adresi:</span> <code class="break-all">${data.wallet_address}</code></p>`;
                     html += `<p><span class="font-semibold">SOL Bakiyesi:</span> ${data.sol_balance !== null ? `${data.sol_balance.toFixed(4)} SOL` : 'Alınamadı'}</p>`;
                     html += `<p><span class="font-semibold">Aktif RPC:</span> <code class="break-all">${data.active_rpc || 'Bilinmiyor'}</code></p>`;
+                    html += `<p><span class="font-semibold">Varsayılan Öncelik Ücreti:</span> <code>${data.DEFAULT_PRIORITY_FEE_LAMPORTS} Lamports</code></p>`;
                 } else if (type === 'settings-content') {
                     for (const key in data) {
                         html += `<p><span class="font-semibold">${key}:</span> <code>${data[key]}</code></p>`;
@@ -1710,7 +1819,7 @@ def index():
                     .then(() => window.location.href = '/login');
             }
 
-            // Sayfa yüklendiğinde verileri çek
+            // Fetch data when page loads
             document.addEventListener('DOMContentLoaded', () => {
                 fetchStatus();
                 fetchSettings();
@@ -1725,12 +1834,9 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        # Basit bir şifre kontrolü, üretimde kullanılmamalıdır!
-        # Ortam değişkeni veya güvenli bir yerden alınmalıdır.
-        password = os.environ.get("DASHBOARD_PASSWORD", "adminpassword") 
-        if request.form['password'] == password:
+        if request.form['password'] == DASHBOARD_PASSWORD:
             session['logged_in'] = True
-            return redirect('/')
+            return redirect(url_for('index'))
         else:
             return render_template_string("""
                 <!DOCTYPE html>
@@ -1833,7 +1939,7 @@ def login():
 @app.route('/logout', methods=['POST'])
 def logout():
     session.pop('logged_in', None)
-    return redirect('/login')
+    return redirect(url_for('login'))
 
 @app.route('/api/status')
 async def api_status():
@@ -1846,6 +1952,7 @@ async def api_status():
     
     balance = await check_wallet_balance()
     wallet_address = str(payer_keypair.pubkey()) if payer_keypair else "Ayarlanmadı"
+    priority_fee = await get_bot_setting("DEFAULT_PRIORITY_FEE_LAMPORTS")
     
     return jsonify({
         "bot_status": bot_status,
@@ -1853,7 +1960,8 @@ async def api_status():
         "auto_sell_enabled": auto_sell_enabled,
         "wallet_address": wallet_address,
         "sol_balance": balance,
-        "active_rpc": active_rpc_url
+        "active_rpc": active_rpc_url,
+        "DEFAULT_PRIORITY_FEE_LAMPORTS": priority_fee
     })
 
 @app.route('/api/settings')
@@ -1865,9 +1973,9 @@ async def api_settings():
     for key in DEFAULT_BOT_SETTINGS.keys():
         value = await get_bot_setting(key)
         if key == "SOLANA_PRIVATE_KEY" and value:
-            settings[key] = value[:5] + "..." + value[-5:] # Maskele
+            settings[key] = value[:5] + "..." + value[-5:] # Mask
         elif key == "JUPITER_API_KEY" and value:
-            settings[key] = value[:5] + "..." + value[-5:] # Maskele
+            settings[key] = value[:5] + "..." + value[-5:] # Mask
         else:
             settings[key] = value if value is not None else "AYARLANMADI"
     return jsonify(settings)
@@ -1888,16 +1996,16 @@ async def api_history():
     history = await get_transaction_history()
     return jsonify(history)
 
-# --- Bot ve Flask Başlatma ---
+# --- Bot and Flask Startup ---
 async def main():
-    # Veritabanını başlat
+    # Initialize database
     await init_db()
     
-    # Varsayılan yöneticiyi ekle (eğer yoksa)
+    # Add default admin (if not exists)
     admins = await get_admins()
     if not admins:
         logger.info(f"Varsayılan yönetici {DEFAULT_ADMIN_ID} ekleniyor.")
-        # Varsayılan yöneticinin adını almak için bir deneme yap
+        # Try to get user's name
         try:
             user = await bot_client.get_entity(DEFAULT_ADMIN_ID)
             first_name = user.first_name if user.first_name else "Varsayılan"
@@ -1908,39 +2016,38 @@ async def main():
         await add_admin(DEFAULT_ADMIN_ID, first_name, last_name, is_default=True)
         await bot_client.send_message(DEFAULT_ADMIN_ID, "Bot başlatıldı ve siz varsayılan yönetici olarak eklendiniz. Ayarlarınızı `/settings` ile yapılandırabilirsiniz.")
     
-    # Varsayılan ayarları veritabanına kaydet (eğer yoksa)
+    # Save default settings to DB (if not exist)
     for key, default_value in DEFAULT_BOT_SETTINGS.items():
         current_value = await get_bot_setting(key)
         if current_value is None:
             await set_bot_setting(key, default_value)
             logger.info(f"Varsayılan ayar '{key}' '{default_value}' olarak kaydedildi.")
 
-    # Solana istemcisini başlat
+    # Initialize Solana client
     await init_solana_client()
 
-    # Telegram botunu başlat
+    # Start Telegram bot
     logger.info("Telegram botu başlatılıyor...")
     await bot_client.start(bot_token=BOT_TOKEN)
     logger.info("Telegram botu başarıyla başlatıldı.")
     
-    # Arka plan görevlerini başlat
+    # Start background tasks
     asyncio.create_task(monitor_open_positions())
     logger.info("Pozisyon izleme görevi başlatıldı.")
 
-    # Botu sürekli çalışır durumda tut
+    # Keep the bot running indefinitely
     await bot_client.run_until_disconnected()
 
 def run_flask():
-    # Flask uygulamasını ayrı bir thread'de çalıştır
-    # debug=True, production için uygun değildir.
+    # Run Flask application in a separate thread
     app.run(host='0.0.0.0', port=5000, debug=False)
 
 if __name__ == '__main__':
-    # Flask'ı ayrı bir thread'de başlat
+    # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
 
-    # asyncio olay döngüsünü başlat ve botu çalıştır
+    # Start asyncio event loop and run the bot
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
