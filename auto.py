@@ -16,7 +16,7 @@ import threading
 from datetime import datetime
 import base64 # Base64 decoding
 
-# Solana Libraries
+# Solana Kütüphaneleri
 from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
@@ -25,7 +25,7 @@ from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
-# from solders.rpc.responses import GetBalanceResp, GetHealthResp # GetHealthResp artık kullanılmayacak
+from solders.rpc.responses import GetBalanceResp # GetBalanceResp nesnesini işlemek için hala gerekli
 
 # --- Ortam Değişkenleri ---
 DB_NAME = os.environ.get("DB_NAME", "your_db_name")
@@ -59,13 +59,10 @@ payer_keypair = None
 # Denenecek RPC uç noktaları listesi (güncellendi)
 RPC_ENDPOINTS = [
     "https://api.mainnet-beta.solana.com",
-    "https://solana-mainnet.rpc.extrnode.com",
+    "https://solana-rpc.web3auth.io",
+    "https://ssc-dao.genesysgo.net",
     "https://rpc.ankr.com/solana",
-    "https://fra59.nodes.rpcpool.com", # Triton One
-    "https://solana-rpc.web3auth.io", # Yeni eklendi
-    "https://ssc-dao.genesysgo.net",   # Yeni eklendi
-    # Helius için API anahtarı gerekecek, bu yüzden şimdilik yorum satırı yapıldı:
-    # "https://rpc.helius.xyz/?api-key=<API_KEY>" 
+    "https://solana-mainnet.rpc.extrnode.com"
 ]
 
 async def get_healthy_client():
@@ -83,30 +80,28 @@ async def get_healthy_client():
             block_height = await asyncio.to_thread(client.get_block_height)
             
             if isinstance(block_height, int) and block_height > 0:
-                logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Mevcut blok yüksekliği: {block_height}")
+                logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Blok yüksekliği: {block_height}")
                 return client
             else:
                 logger.warning(f"RPC {url} sağlıksız görünüyor veya geçersiz blok yüksekliği döndürdü: {block_height}")
         except Exception as e:
-            logger.warning(f"RPC {url} bağlantısı başarısız oldu: {e}")
-    logger.error("Çoklu denemeden sonra sağlıklı RPC uç noktası bulunamadı.")
+            logger.warning(f"RPC {url} bağlantısı başarısız: {str(e)}")
+    logger.error("Tüm RPC uç noktaları başarısız oldu.")
     return None
 
 async def get_balance_with_retry(pubkey: Pubkey, retries=3):
     """
     Solana bakiyesini bir yeniden deneme mekanizmasıyla alır.
-    Hem GetBalanceResp nesnelerini hem de doğrudan dict yanıtlarını işler.
+    GetBalanceResp nesnesini işler.
     """
     for i in range(retries):
         try:
-            resp = await asyncio.to_thread(solana_client.get_balance, pubkey)
+            # commitment="confirmed" eklendi
+            resp = await asyncio.to_thread(solana_client.get_balance, pubkey, commitment="confirmed")
             
-            # Eğer beklenen GetBalanceResp nesnesi ise
-            # solders.rpc.responses.GetBalanceResp artık kullanılmıyor, doğrudan RPC yanıtını işleyin
-            if isinstance(resp, dict) and 'result' in resp and isinstance(resp['result'], dict) and 'value' in resp['result']:
-                return resp['result']['value']
-            elif isinstance(resp, dict) and 'error' in resp:
-                logger.warning(f"get_balance için dict yanıtında RPC Hatası: {resp['error']}. Deneme {i+1}/{retries}")
+            # GetBalanceResp nesnesinin değerini doğrudan döndür
+            if isinstance(resp, GetBalanceResp):
+                return resp.value
             else:
                 logger.warning(f"get_balance için beklenmeyen yanıt türü: {type(resp)}. Tam yanıt: {resp}. Deneme {i+1}/{retries}")
         except Exception as e:
@@ -139,33 +134,33 @@ async def init_solana_client():
     """Solana RPC istemcisini ve cüzdanı başlatır."""
     global solana_client, payer_keypair
     try:
-        # Sağlıklı bir RPC istemcisi almaya çalış
         solana_client = await get_healthy_client()
         if not solana_client:
-            logger.critical("Solana istemcisini başlatma başarısız oldu: Sağlıklı RPC bulunamadı. Otomatik alım-satım işlevleri devre dışı bırakılacak.")
+            logger.critical("Sağlıklı RPC bulunamadı!")
             solana_client = None
-            payer_keypair = None # RPC hazır değilse anahtar çifti de None olsun
+            payer_keypair = None 
             return
 
-        current_private_key = await get_bot_setting("SOLANA_PRIVATE_KEY")
-        if current_private_key:
-            try:
-                payer_keypair = Keypair.from_base58_string(current_private_key)
-                logger.info(f"Solana istemcisi başlatıldı. Cüzdan genel anahtarı: {payer_keypair.pubkey()}")
-                logger.info(f"Aktif RPC URL'si: {solana_client.endpoint_uri}") # Aktif RPC URL'sini logla
-                logger.info(f"Genel Anahtar: {payer_keypair.pubkey()}")
-                
-                balance = await check_wallet_balance()
-                logger.info(f"Başlangıç bakiyesi: {balance if balance is not None else 'Alınamadı'} SOL")
+        priv_key = await get_bot_setting("SOLANA_PRIVATE_KEY")
+        if not priv_key:
+            logger.error("Özel anahtar ayarlanmamış! Otomatik alım-satım işlevleri devre dışı bırakılacak.")
+            payer_keypair = None 
+            return
 
-            except Exception as e:
-                logger.error(f"Özel anahtardan ödeme anahtar çifti başlatılırken hata: {e}", exc_info=True)
-                payer_keypair = None # Kötü ise anahtar çiftini geçersiz kıl
-        else:
-            logger.error("SOLANA_PRIVATE_KEY bot ayarlarında ayarlanmadı. Otomatik alım işlevi devre dışı bırakılacak.")
-            payer_keypair = None # Ayarlanmamışsa anahtar çiftinin None olduğundan emin ol
+        try:
+            payer_keypair = Keypair.from_base58_string(priv_key)
+            logger.info(f"Cüzdan başlatıldı: {payer_keypair.pubkey()}")
+            logger.info(f"Aktif RPC URL'si: {solana_client.endpoint_uri}")
+
+            # Bakiye kontrolü
+            balance = await check_wallet_balance()
+            logger.info(f"Başlangıç bakiyesi: {balance if balance is not None else 'Alınamadı'} SOL")
+
+        except Exception as e:
+            logger.error(f"Özel anahtardan ödeme anahtar çifti başlatılırken hata: {e}", exc_info=True)
+            payer_keypair = None 
     except Exception as e:
-        logger.error(f"Solana istemci başlatma süreci sırasında hata: {e}", exc_info=True)
+        logger.error(f"Solana istemcisi başlatma hatası: {str(e)}", exc_info=True)
         solana_client = None
         payer_keypair = None
 
@@ -662,11 +657,11 @@ async def perform_swap(quote_data: dict):
         # Base64 işlemi çöz
         tx_bytes = base64.b64decode(swap_transaction_str)
         
-        # Yeni yöntem: Ham işlemi doğrudan gönder
+        # Yeni yöntem: Ham işlemi doğrudan gönder (skip_preflight=False olarak ayarlandı)
         tx_signature = await asyncio.to_thread(
             solana_client.send_raw_transaction,
             tx_bytes,
-            opts=TxOpts(skip_preflight=True)
+            opts=TxOpts(skip_preflight=False) # skip_preflight=False olarak değiştirildi
         )
         
         logger.info(f"Takas işlemi gönderildi: {tx_signature}")
@@ -933,7 +928,7 @@ async def monitor_positions_task():
                         f"❌ Otomatik satım başarısız!\nToken: `{token_name}`\nSebep: `{sell_reason}`\nHata: `{message}`",
                         parse_mode='md'
                     )
-                    logger.error(f"{token_name} için otomatik satış başarısız oldu: {message}")
+                    logger.error(f"Otomatik satış {token_name} için başarısız oldu: {message}")
             else:
                 logger.debug(f"{token_name} için satış koşulu karşılanmadı.")
 
@@ -1060,7 +1055,7 @@ async def admin_callback_handler(event):
             if not kb:
                 return await event.edit("🗑 *Kaldırılabilir yönetici bulunamadı.*",
                                        buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
-            return await event.edit("� *Kaldırılacak Yöneticiyi Seç*", buttons=kb, link_preview=False)
+            return await event.edit("🗑 *Kaldırılacak Yöneticiyi Seç*", buttons=kb, link_preview=False)
         if data == 'admin_add_admin':
             pending_input[uid] = {'action': 'confirm_add_admin'}
             return await event.edit("➕ *Yönetici Ekle*\n\nEklenecek kullanıcı kimliğini gönderin:",
