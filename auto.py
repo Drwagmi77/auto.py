@@ -17,8 +17,8 @@ import threading
 # Solana Kütüphaneleri
 from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
-from solana.keypair import Keypair
-from solana.publickey import PublicKey # Bu satır eklendi/doğrulandı
+from solders.keypair import Keypair # Buradaki import yolu güncellendi
+from solana.publickey import PublicKey
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction
@@ -408,7 +408,6 @@ async def retry_telethon_call(coro, max_retries=5, base_delay=1.0):
             logger.warning(f"Retry attempt {i+1}/{max_retries} for Telethon call due to error: {e}")
             if i < max_retries - 1:
                 delay = base_delay * (2 ** i) + random.uniform(0, 1)
-                await asyncio.sleep(delay)
             else:
                 logger.error(f"Max retries reached for Telethon call: {e}")
                 raise
@@ -888,7 +887,7 @@ async def admin_callback_handler(event):
             removable_admins = {aid: info for aid, info in admins.items() if aid != DEFAULT_ADMIN_ID and not info.get("is_default")}
             if removable_admins:
                 kb.append([Button.inline("🗑 Admin Kaldır", b"admin_show_remove_admins")])
-            kb.append([Button.inline("� Geri", b"admin_home")])
+            kb.append([Button.inline("🔙 Geri", b"admin_home")])
             return await event.edit("👤 *Adminleri Yönet*", buttons=kb, link_preview=False)
         if data == 'admin_show_remove_admins':
             admins = await get_admins()
