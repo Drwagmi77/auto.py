@@ -14,6 +14,16 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from flask import Flask, jsonify, request, redirect, session, render_template_string
 import threading
 
+# Solana Kütüphaneleri
+from solana.rpc.api import Client, RPCException
+from solana.rpc.types import TxOpts
+from solana.keypair import Keypair
+from solana.publickey import PublicKey # Bu satır eklendi/doğrulandı
+from solders.transaction import VersionedTransaction
+from solders.message import MessageV0
+from solders.instruction import Instruction
+from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+
 # --- Ortam Değişkenleri ---
 # PostgreSQL Veritabanı Bilgileri
 # Bu değerleri Render veya kullandığınız VPS'te ortam değişkeni olarak ayarlamanız GEREKLİDİR.
@@ -24,7 +34,7 @@ DB_HOST = os.environ.get("DB_HOST", "localhost") # Veritabanı hostu
 DB_PORT = os.environ.get("DB_PORT", "5432") # Veritabanı portu
 
 # Telegram API Bilgileri
-# Bu bot için BotFather'dan aldığınız TOKEN (yeni botunuz için)
+# Bu bot için BotFather'dan aldığınız TOKEN
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 # Kendi Telegram hesabınızın API ID ve HASH'i (my.telegram.org adresinden alın)
 API_ID = int(os.environ.get("API_ID"))
@@ -878,7 +888,7 @@ async def admin_callback_handler(event):
             removable_admins = {aid: info for aid, info in admins.items() if aid != DEFAULT_ADMIN_ID and not info.get("is_default")}
             if removable_admins:
                 kb.append([Button.inline("🗑 Admin Kaldır", b"admin_show_remove_admins")])
-            kb.append([Button.inline("🔙 Geri", b"admin_home")])
+            kb.append([Button.inline("� Geri", b"admin_home")])
             return await event.edit("👤 *Adminleri Yönet*", buttons=kb, link_preview=False)
         if data == 'admin_show_remove_admins':
             admins = await get_admins()
