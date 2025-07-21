@@ -1230,27 +1230,39 @@ async def main():
             logger.info(f"Ayar {setting_key} zaten mevcut: {current_value}")
 
     logger.info("Telegram istemcileri bağlanıyor...")
-    # user_client'ın oturum dosyasını yüklemeye çalışın, yoksa web arayüzünden giriş yapılması gerekecek.
-    # Bu, EOFError'ı önlemek için önemlidir.
-    try:
-        await user_client.start() 
-        logger.info("Kullanıcı istemcisi başarıyla bağlandı veya oturum yüklendi.")
-    except Exception as e:
-        logger.warning(f"Kullanıcı istemcisi başlatılırken hata oluştu (muhtemelen oturum dosyası yok): {e}")
-        logger.warning("Lütfen botunuzun web arayüzüne giderek (Render URL'nizin sonuna /login ekleyerek) Telegram hesabınızla giriş yapın.")
-        # Botun diğer kısımlarının çalışmaya devam etmesi için burada hata fırlatmayın,
-        # ancak kullanıcıya web arayüzünden giriş yapması gerektiğini bildirin.
 
-    await bot_client.start(bot_token=BOT_TOKEN) # Bot oturumu ile başla (mesaj göndermek için)
+    # Bot istemcisini başlat
+    await bot_client.start(bot_token=BOT_TOKEN)
     logger.info("Telegram bot istemcisi bağlandı.")
 
-    # Botun kendisiyle ilgili bilgileri logla
+    # Kullanıcı istemcisini başlatmaya çalış. Hata durumunda logla ve kullanıcıyı yönlendir.
+    # user_client.run_until_disconnected() burada çağrılmayacak.
+    try:
+        if not user_client.is_connected():
+            await user_client.connect() # Oturum dosyasını yüklemeyi veya bağlanmayı dene
+            if user_client.is_connected():
+                logger.info("Kullanıcı istemcisi başarıyla bağlandı veya oturum yüklendi.")
+            else:
+                logger.warning("Kullanıcı istemcisi oturumu bulunamadı veya geçersiz. Lütfen web arayüzünden giriş yapın.")
+                # Render'ın dış URL'sini almak için environment variable kullanıyoruz
+                render_url = os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'auto-py.onrender.com') # Varsayılan Render URL'nizi buraya yazın
+                logger.warning(f"Web arayüzü: https://{render_url}/login")
+        else:
+            logger.info("Kullanıcı istemcisi zaten bağlı.")
+    except Exception as e:
+        logger.warning(f"Kullanıcı istemcisi başlatılırken hata oluştu: {e}")
+        render_url = os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'auto-py.onrender.com') # Varsayılan Render URL'nizi buraya yazın
+        logger.warning(f"Lütfen botunuzun web arayüzüne giderek (https://{render_url}/login) Telegram hesabınızla giriş yapın.")
+        # Hata fırlatmayın, botun diğer kısımlarının çalışmaya devam etmesine izin verin.
+
+
     me_bot = await bot_client.get_me()
     me_user = None
-    try:
-        me_user = await user_client.get_me()
-    except Exception as e:
-        logger.warning(f"Kullanıcı istemcisi bilgileri alınamadı (belki henüz giriş yapılmadı): {e}")
+    if user_client.is_connected():
+        try:
+            me_user = await user_client.get_me()
+        except Exception as e:
+            logger.warning(f"Kullanıcı istemcisi bilgileri alınamadı (belki AuthKeyUnregisteredError): {e}")
 
     logger.info(f"Otomatik Alım/Satım Botu: @{me_bot.username} ({me_bot.id})")
     if me_user:
@@ -1271,17 +1283,19 @@ async def main():
 
     # Flask uygulamasını ayrı bir thread'de çalıştır
     def run_flask():
-        app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+        # Render ortamında debug=True veya use_reloader=True KULLANMAYIN.
+        # Bu, "cannot schedule new futures after interpreter shutdown" hatasına neden olabilir.
+        app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000), debug=False, use_reloader=False)
 
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
     logger.info("Flask web sunucusu başlatıldı.")
 
     logger.info("Bot çalışıyor. Durdurmak için Ctrl+C tuşlarına basın.")
-    # user_client'ın bağlantısının kesilmesini bekleyin, ancak eğer zaten bağlı değilse hata vermeyin.
-    if user_client.is_connected():
-        await user_client.run_until_disconnected()
-    await bot_client.run_until_disconnected()
+    # Ana asyncio döngüsünü süresiz olarak çalışır durumda tut
+    # Bu, arka plan görevlerinin (monitor_positions_task) ve Telethon olay işleyicilerinin çalışmasına izin verecektir.
+    # user_client ve bot_client olay işleyicileri bu döngüye bağlıdır.
+    await asyncio.Future() # Ana döngüyü süresiz olarak çalışır durumda tut
 
 if __name__ == '__main__':
     try:
