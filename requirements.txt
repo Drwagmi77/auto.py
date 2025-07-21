@@ -1,9 +1,9 @@
-psycopg2-binary
-tweepy
-Flask[async]
-greenlet>=3.0.0
-solders==0.16.0
-httpx==0.23.3 
-telethon
-requests
+psycopg2-binary==2.9.9
+tweepy==4.16.0
+Flask==3.0.2
+greenlet==3.0.3
+solders==0.15.0  # solana 0.30.0 ile uyumlu sürüm
+httpx==0.23.3
+telethon==1.34.0
+requests==2.31.0
 solana==0.30.0
