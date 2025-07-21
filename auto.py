@@ -68,6 +68,9 @@ user_client = TelegramClient('auto_buy_user_session', API_ID, API_HASH)
 solana_client = None
 payer_keypair = None
 
+# Global variable to hold the main event loop
+main_loop = None
+
 async def init_solana_client():
     """Solana RPC istemcisini ve cüzdanı başlatır."""
     global solana_client, payer_keypair
@@ -746,10 +749,11 @@ async def login():
             return "<p>Phone number is required.</p>", 400
         session['phone'] = phone
         try:
-            # user_client.connect() çağrısı, oturum dosyası yoksa veya geçersizse bağlantı kurmaya çalışır.
-            # user_client.start() doğrudan input() çağırabilir, bu yüzden burada connect() kullanmak daha güvenli.
-            await user_client.connect()
-            await user_client.send_code_request(phone)
+            # Telethon işlemlerini ana olay döngüsünde güvenli bir şekilde çalıştırın
+            if not asyncio.run_coroutine_threadsafe(user_client.is_connected(), main_loop).result():
+                 asyncio.run_coroutine_threadsafe(user_client.connect(), main_loop).result()
+            
+            asyncio.run_coroutine_threadsafe(user_client.send_code_request(phone), main_loop).result()
             logger.info(f"➡ Sent login code request to {phone}")
             return redirect('/submit-code')
         except Exception as e:
@@ -770,8 +774,8 @@ async def submit_code():
         if not code:
             return "<p>Code is required.</p>", 400
         try:
-            # user_client zaten bağlı olmalı, sadece sign_in çağrısı yeterli
-            await user_client.sign_in(phone, code)
+            # Telethon sign_in işlemini ana olay döngüsünde güvenli bir şekilde çalıştırın
+            asyncio.run_coroutine_threadsafe(user_client.sign_in(phone, code), main_loop).result()
             logger.info(f"✅ Logged in user-client for {phone}")
             session.pop('phone', None)
             return "<p>Login successful! You can close this tab.</p>"
@@ -903,7 +907,7 @@ async def admin_callback_handler(event):
                                  Button.inline("❌ Kaldır", f"remove_admin:{aid}".encode())])
             kb.append([Button.inline("🔙 Geri", b"admin_admins")])
             if not kb:
-                return await event.edit("🗑 *Kaldırılabilir admin yok.*",
+                return await event.edit("� *Kaldırılabilir admin yok.*",
                                        buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
             return await event.edit("🗑 *Kaldırılacak Admini Seç*", buttons=kb, link_preview=False)
         if data == 'admin_add_admin':
@@ -1211,6 +1215,7 @@ async def handle_incoming_signal(event):
 
 async def main():
     """Botu başlatır, veritabanını ve Solana istemcisini başlatır."""
+    global main_loop # main_loop'u global olarak tanımla
     await init_db()
     await init_solana_client() # Solana client'ı başlat
 
@@ -1234,6 +1239,9 @@ async def main():
     # Bot istemcisini başlat
     await bot_client.start(bot_token=BOT_TOKEN)
     logger.info("Telegram bot istemcisi bağlandı.")
+
+    # Ana olay döngüsünü yakala
+    main_loop = asyncio.get_running_loop()
 
     # Kullanıcı istemcisini başlatmaya çalış. Hata durumunda logla ve kullanıcıyı yönlendir.
     # user_client.run_until_disconnected() burada çağrılmayacak.
@@ -1277,7 +1285,7 @@ async def main():
     logger.info(f"Kar Hedefi: {await get_bot_setting('profit_target_x')}x")
     logger.info(f"Stop-Loss: {await get_bot_setting('stop_loss_percent')}%")
 
-    # Pozisyon izleme görevini başlat
+    # Pozisyon izleme görevi başlat
     asyncio.create_task(monitor_positions_task())
     logger.info("Pozisyon izleme görevi başlatıldı.")
 
