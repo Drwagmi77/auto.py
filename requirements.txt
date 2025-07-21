@@ -2,7 +2,6 @@ telethon
 solana
 requests
 psycopg2-binary
-Flask[async]
-gunicorn==20.1.0
-gevent==21.12.0
+tweepy
+Flask>=2.3.0
 greenlet==2.0.3
