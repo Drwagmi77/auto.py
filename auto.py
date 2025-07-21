@@ -404,8 +404,6 @@ async def remove_open_position(contract_address):
     await asyncio.to_thread(remove_open_position_sync, contract_address)
 
 async def add_transaction_history(*args):
-    # args'ı doğrudan add_transaction_history_sync'e iletiyoruz.
-    # Bu wrapper fonksiyonu, add_transaction_history_sync'in beklediği tüm argümanları doğru sırada almalıdır.
     await asyncio.to_thread(add_transaction_history_sync, *args)
 
 async def get_transaction_history():
@@ -563,13 +561,12 @@ async def perform_swap(quote_data: dict):
         serialized_tx = swap_data["swapTransaction"]
         transaction = VersionedTransaction.from_bytes(base64.b64decode(serialized_tx))
         
-        # Yeni imzalama yöntemi
-        signed_tx = transaction.sign([payer_keypair]) # Burası düzeltildi
-        
-        # Transaction'ı gönder
+        # Doğru imzalama ve gönderme yöntemi:
+        # solana_client.send_transaction, işlemi ve imzalayıcıları doğrudan alır.
         tx_signature = await asyncio.to_thread(
             solana_client.send_transaction,
-            signed_tx, # İmzalı işlem nesnesi gönderiliyor
+            transaction,  # İmzalanmamış VersionedTransaction nesnesi
+            payer_keypair, # Keypair nesnesi (imzalayıcı olarak)
             opts=TxOpts(skip_preflight=True)
         )
         
@@ -621,7 +618,7 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
     if not quote_data:
         await add_transaction_history(
             "N/A", 'buy', token_name, contract_address,
-            buy_amount_sol, 0.0, 0.0, 'failed', "Failed to get swap quote." # error_message pozisyonel
+            buy_amount_sol, 0.0, 0.0, 'failed', "Failed to get swap quote."
         )
         logger.error(f"Failed to get swap quote for {contract_address}.")
         return False, "Failed to get swap quote.", None, None
@@ -668,7 +665,7 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
     if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', "Could not get token decimals for selling." # error_message pozisyonel
+            0.0, amount_to_sell_token, 0.0, 'failed', "Could not get token decimals for selling."
         )
         logger.warning(f"Could not get token supply info for {token_name}. Cannot determine decimals for selling.")
         return False, "Could not get token decimals."
@@ -682,7 +679,7 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
     if not quote_data:
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', "Failed to get swap quote for selling." # error_message pozisyonel
+            0.0, amount_to_sell_token, 0.0, 'failed', "Failed to get swap quote for selling."
         )
         logger.error(f"Failed to get swap quote for selling {token_name}.")
         return False, "Failed to get swap quote for selling."
@@ -702,7 +699,7 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
     else:
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', tx_signature # tx_signature burada hata mesajı
+            0.0, amount_to_sell_token, 0.0, 'failed', tx_signature
         )
         logger.error(f"Failed to auto-sell token {token_name}: {tx_signature}")
         return False, f"Failed to sell token {token_name}: {tx_signature}"
@@ -919,7 +916,7 @@ async def admin_callback_handler(event):
                                  Button.inline("❌ Kaldır", f"remove_admin:{admin_id}".encode())])
             kb.append([Button.inline("🔙 Geri", b"admin_admins")])
             if not kb:
-                return await event.edit("� *Kaldırılabilir admin yok.*",
+                return await event.edit("🗑 *Kaldırılabilir admin yok.*",
                                        buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
             return await event.edit("🗑 *Kaldırılacak Admini Seç*", buttons=kb, link_preview=False)
         
