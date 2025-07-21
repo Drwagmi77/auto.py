@@ -11,7 +11,7 @@ from psycopg2.extras import RealDictCursor
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
 from telethon.tl.functions.channels import GetParticipantRequest
-from flask import Flask, jsonify, request, redirect, session, render_template_string # render_template_string hala kullanılıyor
+from flask import Flask, jsonify, request, redirect, session, render_template_string
 import threading
 from datetime import datetime
 
@@ -19,7 +19,7 @@ from datetime import datetime
 from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
-from solders.pubkey import Pubkey
+from solders.pubkey import Pubkey # Pubkey sınıfı import edildi
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction
@@ -48,7 +48,6 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
 # --- Telethon Client'ları ---
-# Sadece bot_client kullanılacak. user_client kaldırıldı.
 bot_client = TelegramClient('auto_buy_bot_session', API_ID, API_HASH)
 
 # --- Solana Client ve Wallet Initialization ---
@@ -472,19 +471,20 @@ def extract_token_name_from_message(text: str) -> str:
     return "unknown"
 
 # --- Solana Auto-Buy Fonksiyonları ---
-async def get_current_token_price_sol(token_mint: Pubkey, amount_token_to_check: float = 0.000000001):
+async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001): # String olarak al
     """Belirli bir token'ın anlık SOL fiyatını tahmin eder."""
     if not solana_client:
         logger.error("Solana client not initialized. Cannot get token price.")
         return None
 
     try:
+        token_mint = Pubkey.from_string(token_mint_str) # from_string kullan
         input_mint = token_mint
-        output_mint = Pubkey("So11111111111111111111111111111111111111112") # SOL mint address
+        output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112") # from_string kullan
 
         token_info = await asyncio.to_thread(solana_client.get_token_supply, token_mint)
         if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
-            logger.warning(f"Could not get token supply info for {token_mint}. Cannot determine decimals.")
+            logger.warning(f"Could not get token supply info for {token_mint_str}. Cannot determine decimals.")
             return None
         decimals = token_info.value.decimals
         
@@ -500,7 +500,7 @@ async def get_current_token_price_sol(token_mint: Pubkey, amount_token_to_check:
             return None
         
         price_sol_per_token = (float(quote_data['outAmount']) / (10**9)) / (float(quote_data['inAmount']) / (10**decimals))
-        logger.debug(f"Current price for {token_mint}: {price_sol_per_token} SOL/token")
+        logger.debug(f"Current price for {token_mint_str}: {price_sol_per_token} SOL/token")
         return price_sol_per_token
 
     except requests.exceptions.RequestException as e:
@@ -558,7 +558,7 @@ async def perform_swap(quote_data: dict):
             return False, "Invalid swap transaction data.", None
 
         serialized_tx = swap_data["swapTransaction"]
-        transaction = await asyncio.to_thread(VersionedTransaction.from_bytes, bytes(serialized_tx, 'base64'))
+        transaction = VersionedTransaction.from_bytes(bytes(serialized_tx, 'base64')) # await asyncio.to_thread kaldırıldı, bu işlem CPU bound
         
         transaction.sign([payer_keypair])
 
@@ -594,8 +594,8 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
         logger.info(f"Contract {contract_address} already processed for auto-buy. Skipping.")
         return False, "Contract already processed.", None, None
 
-    input_mint = Pubkey("So11111111111111111111111111111111111111112")
-    output_mint = Pubkey(contract_address)
+    input_mint = Pubkey.from_string("So11111111111111111111111111111111111111112") # from_string kullan
+    output_mint = Pubkey.from_string(contract_address) # from_string kullan
     amount_in_lamports = int(buy_amount_sol * 10**9)
     slippage_bps = int(slippage_tolerance_percent * 100)
 
@@ -644,8 +644,8 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
         logger.error("Auto-sell skipped: Solana client or wallet not initialized.")
         return False, "Wallet not ready."
 
-    input_mint = Pubkey(contract_address)
-    output_mint = Pubkey("So11111111111111111111111111111111111111112")
+    input_mint = Pubkey.from_string(contract_address) # from_string kullan
+    output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112") # from_string kullan
     slippage_bps = int(slippage_tolerance_percent * 100)
 
     token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint)
@@ -721,7 +721,7 @@ async def monitor_positions_task():
             target_profit_x = pos['target_profit_x']
             stop_loss_percent = pos['stop_loss_percent']
 
-            current_price_sol = await get_current_token_price_sol(Pubkey(contract_address))
+            current_price_sol = await get_current_token_price_sol(contract_address) # String olarak geçir
             if current_price_sol is None:
                 logger.warning(f"Could not get current price for {token_name}. Skipping monitoring for this position.")
                 continue
@@ -766,8 +766,6 @@ async def monitor_positions_task():
 # --- Flask Web Sunucusu ---
 pending_input = {}
 
-# /login ve /submit-code rotaları kaldırıldı
-
 @app.route('/')
 def root():
     """Botun durumunu gösteren ana sayfa."""
@@ -811,7 +809,7 @@ async def admin_callback_handler(event):
             await event.answer('🛑 Bot durduruldu.')
             return await event.edit("🛑 *Bot kapatıldı.*",
                                     buttons=[[Button.inline("🔄 Botu Başlat (çalışır duruma getir)", b"admin_start")],
-                                             [Button.inline("� Geri", b"admin_home")]],
+                                             [Button.inline("🔙 Geri", b"admin_home")]],
                                     link_preview=False)
         
         if data == 'admin_auto_trade_settings':
@@ -1119,8 +1117,6 @@ async def handle_admin_input(event):
         elif action == 'confirm_add_admin':
             try:
                 new_admin_id = int(text_input)
-                # user_client kaldırıldığı için get_entity kullanılamaz.
-                # Varsayılan bir isimle admin ekleyelim.
                 await add_admin(new_admin_id, f"User_{new_admin_id}", "")
                 await event.reply(f"✅ Admin {new_admin_id} eklendi.")
                 logger.info(f"Admin {uid} added new admin {new_admin_id}.")
@@ -1196,7 +1192,6 @@ async def handle_admin_input(event):
                 
                 await set_bot_setting("SOLANA_PRIVATE_KEY", new_private_key)
                 
-                # Yeni anahtarla Solana istemcisini yeniden başlat
                 await init_solana_client()
 
                 test_keypair = None
@@ -1226,7 +1221,6 @@ async def handle_admin_input(event):
                                      buttons=await build_wallet_settings_keyboard(), parse_mode='md', link_preview=False)
 
 # --- Telegram Mesaj İşleyici (Sinyal Kanalı) ---
-# user_client yerine bot_client kullanılacak
 @bot_client.on(events.NewMessage(chats=SOURCE_CHANNEL_ID))
 async def handle_incoming_signal(event):
     """Belirlenen kaynak kanaldan gelen yeni mesajları işler."""
@@ -1270,7 +1264,7 @@ async def handle_incoming_signal(event):
                 stop_loss_percent = float(stop_loss_percent_str)
             except ValueError:
                 logger.error("Otomatik alım/satım ayarları geçersiz. Lütfen kontrol edin.")
-                await bot_client.send_message(DEFAULT_ADMIN_ID, "❌ Otomatik alım/satım ayarları geçersiz. Lütfen kontrol edin.")
+                await bot_client.send_message(DEFAULT_ADMIN_ID, "❌ Otomatik alım/satım ayarları geçersiz. Lütfen kontrol edin.", parse_mode='md')
                 return
 
             success, result_message, actual_buy_price_sol, bought_amount_token = await auto_buy_token(
@@ -1317,10 +1311,10 @@ async def main():
         else:
             logger.info(f"Ayar {setting_key} zaten mevcut: {current_value}")
 
-    await init_solana_client() # Solana client'ı başlat (artık bot_settings'ten private key alacak)
+    await init_solana_client()
 
     logger.info("Telegram istemcisi bağlanıyor...")
-    await bot_client.start(bot_token=BOT_TOKEN) # Sadece bot_client başlatılıyor
+    await bot_client.start(bot_token=BOT_TOKEN)
     logger.info("Telegram istemcisi bağlandı.")
 
     me_bot = await bot_client.get_me()
@@ -1342,7 +1336,7 @@ async def main():
     logger.info("Flask web sunucusu başlatıldı.")
 
     logger.info("Bot çalışıyor. Durdurmak için Ctrl+C tuşlarına basın.")
-    await bot_client.run_until_disconnected() # Sadece bot_client'ın bağlantısı bekleniyor
+    await bot_client.run_until_disconnected()
 
 if __name__ == '__main__':
     try:
@@ -1351,3 +1345,4 @@ if __name__ == '__main__':
         logger.info("Bot kullanıcı tarafından durduruldu.")
     except Exception as e:
         logger.critical(f"Beklenmeyen bir hata oluştu: {e}", exc_info=True)
+
