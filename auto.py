@@ -404,6 +404,7 @@ async def remove_open_position(contract_address):
     await asyncio.to_thread(remove_open_position_sync, contract_address)
 
 async def add_transaction_history(*args):
+    # args'ı doğrudan add_transaction_history_sync'e iletiyoruz.
     # Bu wrapper fonksiyonu, add_transaction_history_sync'in beklediği tüm argümanları doğru sırada almalıdır.
     await asyncio.to_thread(add_transaction_history_sync, *args)
 
@@ -562,20 +563,32 @@ async def perform_swap(quote_data: dict):
         serialized_tx = swap_data["swapTransaction"]
         transaction = VersionedTransaction.from_bytes(base64.b64decode(serialized_tx))
         
-        # transaction.sign([payer_keypair]) satırı kaldırıldı
+        # Yeni imzalama yöntemi
+        signed_tx = transaction.sign([payer_keypair]) # Burası düzeltildi
         
-        # send_transaction metoduna payer_keypair doğrudan imzalayıcı olarak geçirildi
-        tx_signature = await asyncio.to_thread(solana_client.send_transaction, transaction, payer_keypair, opts=TxOpts(skip_preflight=True))
-        logger.info(f"Swap transaction sent: {tx_signature['result']}")
+        # Transaction'ı gönder
+        tx_signature = await asyncio.to_thread(
+            solana_client.send_transaction,
+            signed_tx, # İmzalı işlem nesnesi gönderiliyor
+            opts=TxOpts(skip_preflight=True)
+        )
+        
+        logger.info(f"Swap transaction sent: {tx_signature}")
 
-        confirmation = await asyncio.to_thread(solana_client.confirm_transaction, tx_signature['result'], commitment="confirmed")
+        # Onayı bekle
+        confirmation = await asyncio.to_thread(
+            solana_client.confirm_transaction,
+            tx_signature,
+            commitment="confirmed"
+        )
         
-        if confirmation['result']['value']['err']:
-            logger.error(f"Transaction failed with error: {confirmation['result']['value']['err']}")
-            return False, f"Transaction failed: {confirmation['result']['value']['err']}", None
+        # Onay kontrolü düzeltildi
+        if confirmation.value[0] and confirmation.value[0].err:
+            logger.error(f"Transaction failed with error: {confirmation.value[0].err}")
+            return False, f"Transaction failed: {confirmation.value[0].err}", None
         else:
-            logger.info(f"Transaction confirmed: {tx_signature['result']}")
-            return True, tx_signature['result'], quote_data
+            logger.info(f"Transaction confirmed: {tx_signature}")
+            return True, tx_signature, quote_data
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Error performing swap with Jupiter: {e}")
@@ -606,10 +619,9 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
 
     quote_data = await get_swap_quote(input_mint, output_mint, amount_in_lamports, slippage_bps)
     if not quote_data:
-        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'buy', token_name, contract_address,
-            buy_amount_sol, 0.0, 0.0, 'failed', "Failed to get swap quote."
+            buy_amount_sol, 0.0, 0.0, 'failed', "Failed to get swap quote." # error_message pozisyonel
         )
         logger.error(f"Failed to get swap quote for {contract_address}.")
         return False, "Failed to get swap quote.", None, None
@@ -635,7 +647,6 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
         logger.info(f"Successfully auto-bought token {contract_address}. Tx: {tx_signature}")
         return True, f"Successfully bought token {token_name}. Tx: {tx_signature}", actual_buy_price_sol, bought_amount_token
     else:
-        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'buy', token_name, contract_address,
             buy_amount_sol, 0.0, 0.0, 'failed', tx_signature # tx_signature burada hata mesajı
@@ -655,10 +666,9 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
 
     token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint)
     if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
-        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', "Could not get token decimals for selling."
+            0.0, amount_to_sell_token, 0.0, 'failed', "Could not get token decimals for selling." # error_message pozisyonel
         )
         logger.warning(f"Could not get token supply info for {token_name}. Cannot determine decimals for selling.")
         return False, "Could not get token decimals."
@@ -670,10 +680,9 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
 
     quote_data = await get_swap_quote(input_mint, output_mint, amount_in_lamports, slippage_bps)
     if not quote_data:
-        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', "Failed to get swap quote for selling."
+            0.0, amount_to_sell_token, 0.0, 'failed', "Failed to get swap quote for selling." # error_message pozisyonel
         )
         logger.error(f"Failed to get swap quote for selling {token_name}.")
         return False, "Failed to get swap quote for selling."
@@ -691,10 +700,9 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
         logger.info(f"Successfully auto-sold token {token_name}. Tx: {tx_signature}")
         return True, f"Successfully sold token {token_name}. Tx: {tx_signature}"
     else:
-        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', tx_signature
+            0.0, amount_to_sell_token, 0.0, 'failed', tx_signature # tx_signature burada hata mesajı
         )
         logger.error(f"Failed to auto-sell token {token_name}: {tx_signature}")
         return False, f"Failed to sell token {token_name}: {tx_signature}"
@@ -911,7 +919,7 @@ async def admin_callback_handler(event):
                                  Button.inline("❌ Kaldır", f"remove_admin:{admin_id}".encode())])
             kb.append([Button.inline("🔙 Geri", b"admin_admins")])
             if not kb:
-                return await event.edit("🗑 *Kaldırılabilir admin yok.*",
+                return await event.edit("� *Kaldırılabilir admin yok.*",
                                        buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
             return await event.edit("🗑 *Kaldırılacak Admini Seç*", buttons=kb, link_preview=False)
         
