@@ -1527,4 +1527,3 @@ if __name__ == '__main__':
         logger.info("Bot kullanıcı tarafından durduruldu.")
     except Exception as e:
         logger.critical(f"Beklenmeyen bir hata oluştu: {e}", exc_info=True)
-
