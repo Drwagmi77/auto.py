@@ -21,7 +21,7 @@ from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction
+from solders.transaction import VersionedTransaction # VersionedTransaction hala kullanılabilir, ancak doğrudan imzalanmayacak
 from solders.message import MessageV0
 from solders.instruction import Instruction
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
@@ -558,15 +558,13 @@ async def perform_swap(quote_data: dict):
             logger.error(f"Invalid swap data received from Jupiter: {swap_data}")
             return False, "Invalid swap transaction data.", None
 
-        serialized_tx = swap_data["swapTransaction"]
-        transaction = VersionedTransaction.from_bytes(base64.b64decode(serialized_tx))
+        # Base64 decode transaction
+        tx_bytes = base64.b64decode(swap_data["swapTransaction"])
         
-        # Doğru imzalama ve gönderme yöntemi:
-        # solana_client.send_transaction, işlemi ve imzalayıcıları doğrudan alır.
+        # Yeni yöntem: Transaction'ı doğrudan raw olarak gönder
         tx_signature = await asyncio.to_thread(
-            solana_client.send_transaction,
-            transaction,  # İmzalanmamış VersionedTransaction nesnesi
-            payer_keypair, # Keypair nesnesi (imzalayıcı olarak)
+            solana_client.send_raw_transaction,
+            tx_bytes,
             opts=TxOpts(skip_preflight=True)
         )
         
@@ -579,8 +577,8 @@ async def perform_swap(quote_data: dict):
             commitment="confirmed"
         )
         
-        # Onay kontrolü düzeltildi
-        if confirmation.value[0] and confirmation.value[0].err:
+        # Onay kontrolü
+        if confirmation.value and confirmation.value[0].err:
             logger.error(f"Transaction failed with error: {confirmation.value[0].err}")
             return False, f"Transaction failed: {confirmation.value[0].err}", None
         else:
@@ -594,8 +592,8 @@ async def perform_swap(quote_data: dict):
         logger.error(f"Solana RPC error during swap: {e}")
         return False, f"Solana RPC error: {e}", None
     except Exception as e:
-        logger.error(f"Unexpected error in perform_swap: {e}")
-        return False, f"Unexpected error: {e}", None
+        logger.error(f"Unexpected error in perform_swap: {str(e)}", exc_info=True)
+        return False, f"Unexpected error: {str(e)}", None
 
 async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol: float, slippage_tolerance_percent: float):
     """Belirtilen kontrat adresindeki token'ı otomatik olarak satın alır."""
@@ -606,6 +604,25 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
     if await is_contract_processed(contract_address):
         logger.info(f"Contract {contract_address} already processed for auto-buy. Skipping.")
         return False, "Contract already processed.", None, None
+
+    # Cüzdan bakiyesi kontrolü eklendi
+    current_balance_response = await asyncio.to_thread(solana_client.get_balance, payer_keypair.pubkey())
+    if not current_balance_response or not hasattr(current_balance_response, 'value'):
+        logger.error("Could not retrieve current wallet balance for pre-check.")
+        return False, "Could not retrieve wallet balance.", None, None
+    
+    current_balance_lamports = current_balance_response.value
+    buy_amount_lamports = int(buy_amount_sol * 10**9)
+
+    if current_balance_lamports < buy_amount_lamports:
+        error_msg = f"Insufficient SOL balance. Required: {buy_amount_sol} SOL, Available: {current_balance_lamports / 10**9} SOL."
+        logger.error(error_msg)
+        await add_transaction_history(
+            "N/A", 'buy', token_name, contract_address,
+            buy_amount_sol, 0.0, 0.0, 'failed', error_msg
+        )
+        return False, error_msg, None, None
+
 
     input_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
     output_mint = Pubkey.from_string(contract_address)
