@@ -69,6 +69,11 @@ RPC_ENDPOINTS = [
 # Aktif RPC URL'sini tutmak için global değişken
 active_rpc_url = None
 
+# Jupiter API çağrıları için global kilit
+jupiter_api_lock = asyncio.Lock()
+last_jupiter_call_time = 0
+JUPITER_RATE_LIMIT_DELAY = 0.5 # Her Jupiter API çağrısı arasında en az 0.5 saniye bekle
+
 async def get_healthy_client():
     """
     Önceden tanımlanmış bir listeden sağlıklı bir Solana RPC uç noktasına bağlanmaya çalışır.
@@ -141,37 +146,45 @@ async def check_wallet_balance():
 async def init_solana_client():
     """Solana RPC istemcisini ve cüzdanı başlatır."""
     global solana_client, payer_keypair
+
+    # Reset them at the start to ensure clean state for re-initialization
+    solana_client = None
+    payer_keypair = None
+
     try:
-        solana_client = await get_healthy_client()
-        if not solana_client:
-            logger.critical("Sağlıklı RPC bulunamadı!")
-            solana_client = None
-            payer_keypair = None 
-            return
+        client_temp = await get_healthy_client()
+        if not client_temp:
+            logger.critical("Sağlıklı RPC bulunamadı! Solana istemcisi başlatılamadı.")
+            return # solana_client and payer_keypair remain None
 
         priv_key = await get_bot_setting("SOLANA_PRIVATE_KEY")
         if not priv_key:
             logger.error("Özel anahtar ayarlanmamış! Otomatik alım-satım işlevleri devre dışı bırakılacak.")
-            payer_keypair = None 
-            return
+            return # payer_keypair remains None
 
         try:
-            payer_keypair = Keypair.from_base58_string(priv_key)
-            logger.info(f"Cüzdan başlatıldı: {payer_keypair.pubkey()}")
-            # active_rpc_url değişkenini kullanarak loglama yapıldı
-            logger.info(f"Aktif RPC URL'si: {active_rpc_url if active_rpc_url else 'Bilinmiyor'}") 
+            keypair_temp = Keypair.from_base58_string(priv_key)
+            solana_client = client_temp # Only assign if keypair is successfully created
+            payer_keypair = keypair_temp # Only assign if keypair is successfully created
 
-            # Bakiye kontrolü
+            logger.info(f"Cüzdan başlatıldı: {payer_keypair.pubkey()}")
+            logger.info(f"Aktif RPC URL'si: {active_rpc_url if active_rpc_url else 'Bilinmiyor'}")
+
+            # Bakiye kontrolü (this can fail without invalidating the client/keypair)
             balance = await check_wallet_balance()
             logger.info(f"Başlangıç bakiyesi: {balance if balance is not None else 'Alınamadı'} SOL")
 
         except Exception as e:
             logger.error(f"Özel anahtardan ödeme anahtar çifti başlatılırken hata: {e}", exc_info=True)
-            payer_keypair = None 
+            # If keypair creation fails, ensure they remain None
+            solana_client = None
+            payer_keypair = None
+            return # Exit if keypair initialization fails
+
     except Exception as e:
+        # This outer catch is for errors during get_healthy_client or get_bot_setting
         logger.error(f"Solana istemcisi başlatma hatası: {str(e)}", exc_info=True)
-        solana_client = None
-        payer_keypair = None
+        # solana_client and payer_keypair are already None from the start or from inner except
 
 # --- Veritabanı Bağlantısı ve Yönetim Fonksiyonları (PostgreSQL) ---
 def get_connection():
@@ -570,135 +583,192 @@ def extract_token_name_from_message(text: str) -> str:
     return "unknown"
 
 # --- Solana Otomatik Alım Fonksiyonları ---
-async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001):
-    """Belirli bir token'ın mevcut SOL fiyatını tahmin eder."""
+async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001, max_retries=7, initial_delay=2.0):
+    """Belirli bir token'ın mevcut SOL fiyatını tahmin eder, yeniden deneme ile."""
+    global last_jupiter_call_time
+
     if not solana_client:
         logger.error("Solana istemcisi başlatılmadı. Token fiyatı alınamıyor.")
         return None
 
-    try:
-        token_mint = Pubkey.from_string(token_mint_str)
-        input_mint = token_mint
-        output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
+    async with jupiter_api_lock:
+        # Rate limit gecikmesini uygula
+        elapsed_time = time.time() - last_jupiter_call_time
+        if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
+            await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
 
-        token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint) 
-        if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
-            logger.warning(f"{token_mint_str} için token arz bilgisi alınamadı. Ondalık basamaklar belirlenemiyor.")
-            return None
-        decimals = token_info.value.decimals
-        
-        amount_in_lamports = int(amount_token_to_check * (10**decimals))
+        for attempt in range(max_retries):
+            try:
+                token_mint = Pubkey.from_string(token_mint_str)
+                input_mint = token_mint
+                output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
 
-        quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps=0"
-        response = requests.get(quote_url)
-        response.raise_for_status()
-        quote_data = response.json()
+                token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint) 
+                if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
+                    logger.warning(f"{token_mint_str} için token arz bilgisi alınamadı. Ondalık basamaklar belirlenemiyor.")
+                    return None
+                decimals = token_info.value.decimals
+                
+                amount_in_lamports = int(amount_token_to_check * (10**decimals))
 
-        if not quote_data or "outAmount" not in quote_data or "inAmount" not in quote_data:
-            logger.warning(f"Fiyat kontrolü için geçersiz teklif verisi: {quote_data}")
-            return None
-        
-        price_sol_per_token = (float(quote_data['outAmount']) / (10**9)) / (float(quote_data['inAmount']) / (10**decimals))
-        logger.debug(f"{token_mint_str} için mevcut fiyat: {price_sol_per_token} SOL/token")
-        return price_sol_per_token
+                quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps=0"
+                
+                response = requests.get(quote_url)
+                response.raise_for_status()
+                quote_data = response.json()
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Jupiter'den token fiyatı alınırken hata: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"get_current_token_price_sol içinde beklenmeyen hata: {e}")
-        return None
+                if not quote_data or "outAmount" not in quote_data or "inAmount" not in quote_data:
+                    logger.warning(f"Fiyat kontrolü için geçersiz teklif verisi: {quote_data}. Deneme {attempt+1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
+                    continue
+                
+                price_sol_per_token = (float(quote_data['outAmount']) / (10**9)) / (float(quote_data['inAmount']) / (10**decimals))
+                logger.debug(f"{token_mint_str} için mevcut fiyat: {price_sol_per_token} SOL/token")
+                last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
+                return price_sol_per_token
 
-async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamports: int, slippage_bps: int):
-    """Jupiter Aggregator'dan bir takas teklifi alır."""
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Jupiter'den token fiyatı alınırken hata (deneme {attempt+1}/{max_retries}): {e}")
+                if e.response is not None and e.response.status_code == 429:
+                    # 429 hatası durumunda daha uzun bekle
+                    delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
+                    await asyncio.sleep(delay)
+                elif attempt < max_retries - 1:
+                    # Diğer istek hataları için varsayılan gecikme
+                    await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
+                else:
+                    logger.error(f"Jupiter'den token fiyatı alınırken maksimum yeniden deneme sayısına ulaşıldı: {e}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_current_token_price_sol içinde beklenmeyen hata: {e}", exc_info=True)
+                return None
+        last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
+    return None
+
+
+async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamports: int, slippage_bps: int, max_retries=7, initial_delay=2.0):
+    """Jupiter Aggregator'dan bir takas teklifi alır, yeniden deneme ile."""
+    global last_jupiter_call_time
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Teklif alınamıyor.")
         return None
 
-    try:
-        quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps={slippage_bps}"
-        response = requests.get(quote_url)
-        response.raise_for_status()
-        quote_data = response.json()
-        
-        if not quote_data or "swapMode" not in quote_data:
-            logger.error(f"Geçersiz teklif verisi alındı: {quote_data}")
-            return None
+    async with jupiter_api_lock:
+        # Rate limit gecikmesini uygula
+        elapsed_time = time.time() - last_jupiter_call_time
+        if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
+            await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
 
-        logger.info(f"Jupiter teklifi {input_mint}'ten {output_mint}'e alındı: {quote_data.get('outAmount')} {quote_data.get('outputToken', {}).get('symbol')}")
-        return quote_data
+        for attempt in range(max_retries):
+            try:
+                quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps={slippage_bps}"
+                response = requests.get(quote_url)
+                response.raise_for_status()
+                quote_data = response.json()
+                
+                if not quote_data or "swapMode" not in quote_data:
+                    logger.error(f"Geçersiz teklif verisi alındı: {quote_data}. Deneme {attempt+1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
+                    continue
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Jupiter teklifi alınırken hata: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"get_swap_quote içinde beklenmeyen hata: {e}")
-        return None
+                logger.info(f"Jupiter teklifi {input_mint}'ten {output_mint}'e alındı: {quote_data.get('outAmount')} {quote_data.get('outputToken', {}).get('symbol')}")
+                last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
+                return quote_data
+
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Jupiter teklifi alınırken hata (deneme {attempt+1}/{max_retries}): {e}")
+                if e.response is not None and e.response.status_code == 429:
+                    # 429 hatası durumunda daha uzun bekle
+                    delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
+                    await asyncio.sleep(delay)
+                elif attempt < max_retries - 1:
+                    # Diğer istek hataları için varsayılan gecikme
+                    await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
+                else:
+                    logger.error(f"Jupiter teklifi alınırken maksimum yeniden deneme sayısına ulaşıldı: {e}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_swap_quote içinde beklenmeyen hata: {e}", exc_info=True)
+                return None
+        last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
+    return None # Tüm yeniden denemeler başarısız olursa None döndür
 
 async def perform_swap(quote_data: dict):
     """Jupiter Aggregator'dan alınan teklifle bir takas işlemi gerçekleştirir."""
+    global last_jupiter_call_time
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Takas yapılamıyor.")
         return False, "Solana istemcisi veya cüzdan hazır değil.", None
 
-    try:
-        swap_url = f"{JUPITER_API_URL}/swap"
-        swap_response = requests.post(swap_url, json={
-            "quoteResponse": quote_data,
-            "userPublicKey": str(payer_keypair.pubkey()),
-            "wrapUnwrapSOL": True,
-            "prioritizationFeeLamports": 100000
-        })
-        swap_response.raise_for_status() # Kötü yanıtlar için HTTPError yükseltir (örn. 4xx, 5xx)
-        swap_data = swap_response.json()
+    async with jupiter_api_lock:
+        # Rate limit gecikmesini uygula
+        elapsed_time = time.time() - last_jupiter_call_time
+        if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
+            await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
 
-        if not swap_data or "swapTransaction" not in swap_data:
-            logger.error(f"Jupiter'den geçersiz takas verisi alındı: {swap_data}")
-            return False, "Geçersiz takas işlem verisi.", None
+        try:
+            swap_url = f"{JUPITER_API_URL}/swap"
+            swap_response = requests.post(swap_url, json={
+                "quoteResponse": quote_data,
+                "userPublicKey": str(payer_keypair.pubkey()),
+                "wrapUnwrapSOL": True,
+                "prioritizationFeeLamports": 100000
+            })
+            swap_response.raise_for_status() # Kötü yanıtlar için HTTPError yükseltir (örn. 4xx, 5xx)
+            swap_data = swap_response.json()
 
-        # KRİTİK DÜZELTME: swapTransaction'ın çözmeden önce bir dize olduğundan emin olun
-        swap_transaction_str = swap_data.get("swapTransaction")
-        if not isinstance(swap_transaction_str, str):
-            error_msg = f"Jupiter API 'swapTransaction'ı dize olarak döndürmedi. Tür: {type(swap_transaction_str)}, Değer: {swap_transaction_str}"
-            logger.error(error_msg)
-            return False, error_msg, None
+            if not swap_data or "swapTransaction" not in swap_data:
+                logger.error(f"Jupiter'den geçersiz takas verisi alındı: {swap_data}")
+                return False, "Geçersiz takas işlem verisi.", None
 
-        # Base64 işlemi çöz
-        tx_bytes = base64.b64decode(swap_transaction_str)
-        
-        # Yeni yöntem: Ham işlemi doğrudan gönder (skip_preflight=False olarak ayarlandı)
-        tx_signature = await asyncio.to_thread(
-            solana_client.send_raw_transaction,
-            tx_bytes,
-            opts=TxOpts(skip_preflight=False) # skip_preflight=False olarak değiştirildi
-        )
-        
-        logger.info(f"Takas işlemi gönderildi: {tx_signature}")
+            # KRİTİK DÜZELTME: swapTransaction'ın çözmeden önce bir dize olduğundan emin olun
+            swap_transaction_str = swap_data.get("swapTransaction")
+            if not isinstance(swap_transaction_str, str):
+                error_msg = f"Jupiter API 'swapTransaction'ı dize olarak döndürmedi. Tür: {type(swap_transaction_str)}, Değer: {swap_transaction_str}"
+                logger.error(error_msg)
+                return False, error_msg, None
 
-        # Onay bekle
-        confirmation = await asyncio.to_thread(
-            solana_client.confirm_transaction,
-            tx_signature,
-            commitment="confirmed"
-        )
-        
-        # Onayı kontrol et
-        if confirmation.value and confirmation.value[0].err:
-            logger.error(f"İşlem hatayla başarısız oldu: {confirmation.value[0].err}")
-            return False, f"İşlem başarısız oldu: {confirmation.value[0].err}", None
-        else:
-            logger.info(f"İşlem onaylandı: {tx_signature}")
-            return True, tx_signature, quote_data
+            # Base64 işlemi çöz
+            tx_bytes = base64.b64decode(swap_transaction_str)
+            
+            # Yeni yöntem: Ham işlemi doğrudan gönder (skip_preflight=False olarak ayarlandı)
+            tx_signature = await asyncio.to_thread(
+                solana_client.send_raw_transaction,
+                tx_bytes,
+                opts=TxOpts(skip_preflight=False) # skip_preflight=False olarak değiştirildi
+            )
+            
+            logger.info(f"Takas işlemi gönderildi: {tx_signature}")
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Jupiter ile takas yapılırken hata: {e}")
-        return False, f"HTTP istek hatası: {e}", None
-    except RPCException as e:
-        logger.error(f"Takas sırasında Solana RPC hatası: {e}")
-        return False, f"Solana RPC hatası: {e}", None
-    except Exception as e:
-        logger.error(f"perform_swap içinde beklenmeyen hata: {str(e)}", exc_info=True)
-        return False, f"Beklenmeyen hata: {str(e)}", None
+            # Onay bekle
+            confirmation = await asyncio.to_thread(
+                solana_client.confirm_transaction,
+                tx_signature,
+                commitment="confirmed"
+            )
+            
+            # Onayı kontrol et
+            if confirmation.value and confirmation.value[0].err:
+                logger.error(f"İşlem hatayla başarısız oldu: {confirmation.value[0].err}")
+                return False, f"İşlem başarısız oldu: {confirmation.value[0].err}", None
+            else:
+                logger.info(f"İşlem onaylandı: {tx_signature}")
+                last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
+                return True, tx_signature, quote_data
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Jupiter ile takas yapılırken hata: {e}")
+            return False, f"HTTP istek hatası: {e}", None
+        except RPCException as e:
+            logger.error(f"Takas sırasında Solana RPC hatası: {e}")
+            return False, f"Solana RPC hatası: {e}", None
+        except Exception as e:
+            logger.error(f"perform_swap içinde beklenmeyen hata: {str(e)}", exc_info=True)
+            return False, f"Beklenmeyen hata: {str(e)}", None
 
 async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol: float, slippage_tolerance_percent: float):
     """Belirtilen sözleşme adresindeki token'ı otomatik olarak satın alır."""
@@ -1034,7 +1104,7 @@ async def admin_callback_handler(event):
             pending_input[uid] = {'action': 'set_profit_target'}
             kb = [[Button.inline("🔙 Geri", b"admin_auto_trade_settings")]]
             current_target = await get_bot_setting("profit_target_x")
-            return await event.edit(f"� *Kar Hedefini Ayarla*\n\nMevcut hedef: `{current_target}x`\n\nSatıştan önce token fiyatının kaç kat artması gerektiğini girin (örn. 2x için `2.0`, 5x için `5.0`):",
+            return await event.edit(f"📈 *Kar Hedefini Ayarla*\n\nMevcut hedef: `{current_target}x`\n\nSatıştan önce token fiyatının kaç kat artması gerektiğini girin (örn. 2x için `2.0`, 5x için `5.0`):",
                                     buttons=kb, link_preview=False)
         if data == 'admin_set_stop_loss':
             pending_input[uid] = {'action': 'set_stop_loss'}
@@ -1079,7 +1149,7 @@ async def admin_callback_handler(event):
                 if admin_id != DEFAULT_ADMIN_ID and not info.get("is_default"):
                     kb.append([Button.inline(f"{info.get('first_name', 'N/A')} ({admin_id})", b"noop"),
                                  Button.inline("❌ Kaldır", f"remove_admin:{admin_id}".encode())])
-            kb.append([Button.inline("🔙 Geri", b"admin_admins")])
+            kb.append([Button.inline("� Geri", b"admin_admins")])
             if not kb:
                 return await event.edit("🗑 *Kaldırılabilir yönetici bulunamadı.*",
                                        buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
@@ -1125,7 +1195,7 @@ async def admin_callback_handler(event):
                     history_text += "\n"
             
             kb = [[Button.inline("🔙 Geri", b"admin_home")]]
-            return await event.edit(history_text, buttons=kb, parse_preview=False) # link_preview=False yerine parse_preview=False kullanıldı
+            return await event.edit(history_text, buttons=kb, parse_mode='md', link_preview=False) # link_preview=False kullanıldı
 
         await event.answer("Bilinmeyen eylem.")
 
@@ -1371,21 +1441,13 @@ async def handle_admin_input(event):
                 # Yeni anahtarla Solana istemcisini ve anahtar çiftini yeniden başlat
                 await init_solana_client()
 
-                test_keypair = None
-                try:
-                    test_keypair = Keypair.from_base58_string(new_private_key)
-                except Exception as e:
-                    await event.reply(f"❌ Girilen özel anahtar geçersiz formatta: {e}")
-                    logger.error(f"Yönetici {uid} tarafından girilen geçersiz özel anahtar formatı: {e}")
-                    return await event.reply(await get_wallet_settings_dashboard(),
-                                             buttons=await build_wallet_settings_keyboard(), parse_mode='md', link_preview=False)
-
-                if payer_keypair and str(payer_keypair.pubkey()) == str(test_keypair.pubkey()):
+                # init_solana_client() çağrısından sonra global payer_keypair'in durumunu kontrol et
+                if payer_keypair:
                      await event.reply(f"✅ Yeni özel anahtar başarıyla ayarlandı. Yeni Genel Anahtar: `{payer_keypair.pubkey()}`")
                      logger.info(f"Yönetici {uid} yeni Solana özel anahtarını ayarladı.")
                 else:
-                    await event.reply("❌ Özel anahtar ayarlanırken bir sorun oluştu veya anahtar geçersiz.")
-                    logger.error(f"Yönetici {uid} için yeni özel anahtar ayarlanamadı.")
+                    await event.reply("❌ Özel anahtar ayarlanırken bir sorun oluştu veya anahtar geçersiz. Lütfen logları kontrol edin.")
+                    logger.error(f"Yönetici {uid} için yeni özel anahtar ayarlanamadı (init_solana_client sonrası payer_keypair hala None).")
 
             except ValueError as ve:
                 await event.reply(f"❌ Geçersiz özel anahtar formatı: {ve}")
@@ -1527,3 +1589,4 @@ if __name__ == '__main__':
         logger.info("Bot kullanıcı tarafından durduruldu.")
     except Exception as e:
         logger.critical(f"Beklenmeyen bir hata oluştu: {e}", exc_info=True)
+
