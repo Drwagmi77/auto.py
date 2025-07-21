@@ -25,7 +25,7 @@ from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
-from solders.rpc.responses import GetBalanceResp # GetBalanceResp nesnesini işlemek için hala gerekli
+from solders.rpc.responses import GetBalanceResp, GetBlockHeightResp 
 
 # --- Ortam Değişkenleri ---
 DB_NAME = os.environ.get("DB_NAME", "your_db_name")
@@ -41,7 +41,7 @@ API_HASH = os.environ.get("API_HASH")
 SOURCE_CHANNEL_ID = int(os.environ.get("SOURCE_CHANNEL_ID")) 
 
 SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY") 
-SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com") # Bu artık kullanılmayacak, RPC_ENDPOINTS listesi kullanılacak
 JUPITER_API_URL = os.environ.get("JUPITER_API_URL", "https://quote-api.jup.ag/v6")
 
 SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(24).hex())
@@ -56,9 +56,10 @@ bot_client = TelegramClient('auto_buy_bot_session', API_ID, API_HASH)
 solana_client = None
 payer_keypair = None
 
-# Denenecek RPC uç noktaları listesi (güncellendi)
+# Denenecek RPC uç noktaları listesi (Helius RPC ile güncellendi)
 RPC_ENDPOINTS = [
-    "https://api.mainnet-beta.solana.com",
+    "https://mainnet.helius-rpc.com/?api-key=7930dbab-e806-4f3f-bf3b-716a14c6e3c3", # Helius Mainnet RPC
+    "https://api.mainnet-beta.solana.com", # Yedek olarak genel RPC
     "https://solana-rpc.web3auth.io",
     "https://ssc-dao.genesysgo.net",
     "https://rpc.ankr.com/solana",
@@ -77,13 +78,14 @@ async def get_healthy_client():
             
             # Sağlık kontrolü için get_block_height() kullanılıyor
             # Bu, RPC'nin temel bir isteğe yanıt verip vermediğini kontrol eder.
-            block_height = await asyncio.to_thread(client.get_block_height)
+            block_height_resp = await asyncio.to_thread(client.get_block_height) 
             
-            if isinstance(block_height, int) and block_height > 0:
-                logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Blok yüksekliği: {block_height}")
+            # GetBlockHeightResp nesnesini ve değerini kontrol et
+            if isinstance(block_height_resp, GetBlockHeightResp) and block_height_resp.value is not None and block_height_resp.value > 0:
+                logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Blok yüksekliği: {block_height_resp.value}")
                 return client
             else:
-                logger.warning(f"RPC {url} sağlıksız görünüyor veya geçersiz blok yüksekliği döndürdü: {block_height}")
+                logger.warning(f"RPC {url} sağlıksız görünüyor veya geçersiz blok yüksekliği döndürdü: {block_height_resp}")
         except Exception as e:
             logger.warning(f"RPC {url} bağlantısı başarısız: {str(e)}")
     logger.error("Tüm RPC uç noktaları başarısız oldu.")
