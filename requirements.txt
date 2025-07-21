@@ -4,4 +4,4 @@ requests
 psycopg2-binary
 tweepy
 Flask>=2.3.0
-greenlet==2.0.3
+greenlet==2.0.2
