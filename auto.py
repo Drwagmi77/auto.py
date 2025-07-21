@@ -75,9 +75,10 @@ async def init_solana_client():
         solana_client = Client(SOLANA_RPC_URL)
         if SOLANA_PRIVATE_KEY:
             payer_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
-            logger.info(f"Solana client initialized. Wallet public key: {payer_keypair.public_key}")
+            # DÜZELTME: Keypair objesinin public_key'i artık pubkey() metoduyla erişilir.
+            logger.info(f"Solana client initialized. Wallet public key: {payer_keypair.pubkey()}")
             # Cüzdan bakiyesini kontrol et
-            balance_response = await asyncio.to_thread(solana_client.get_balance, payer_keypair.public_key)
+            balance_response = await asyncio.to_thread(solana_client.get_balance, payer_keypair.pubkey())
             if balance_response and 'result' in balance_response and 'value' in balance_response['result']:
                 balance_lamports = balance_response['result']['value']
                 logger.info(f"Wallet balance: {balance_lamports / 10**9} SOL") # Lamports to SOL
@@ -86,6 +87,7 @@ async def init_solana_client():
         else:
             logger.error("SOLANA_PRIVATE_KEY not set. Auto-buying functionality will be disabled.")
             solana_client = None # Alım yapamayız
+            payer_keypair = None # Alım yapamayız
     except Exception as e:
         logger.error(f"Error initializing Solana client or wallet: {e}")
         solana_client = None
@@ -515,7 +517,7 @@ async def perform_swap(quote_data: dict):
         swap_url = f"{JUPITER_API_URL}/swap"
         swap_response = requests.post(swap_url, json={
             "quoteResponse": quote_data,
-            "userPublicKey": str(payer_keypair.public_key),
+            "userPublicKey": str(payer_keypair.pubkey()), # Düzeltme: public_key() metodu kullanıldı
             "wrapUnwrapSOL": True, # Gerekirse SOL'u WEN/WSOL'a dönüştür
             "prioritizationFeeLamports": 100000 # Küçük bir öncelik ücreti ekle (isteğe bağlı)
         })
@@ -665,7 +667,7 @@ async def monitor_positions_task():
             target_profit_x = pos['target_profit_x']
             stop_loss_percent = pos['stop_loss_percent']
 
-            current_price_sol = await get_current_token_price_sol(Pubkey(contract_address))
+            current_price_sol = await get_current_token_price_sol(Pubkey(contract_address)) # Düzeltme: Pubkey kullanıldı
             if current_price_sol is None:
                 logger.warning(f"Could not get current price for {token_name}. Skipping monitoring for this position.")
                 continue
@@ -744,6 +746,8 @@ async def login():
             return "<p>Phone number is required.</p>", 400
         session['phone'] = phone
         try:
+            # user_client.connect() çağrısı, oturum dosyası yoksa veya geçersizse bağlantı kurmaya çalışır.
+            # user_client.start() doğrudan input() çağırabilir, bu yüzden burada connect() kullanmak daha güvenli.
             await user_client.connect()
             await user_client.send_code_request(phone)
             logger.info(f"➡ Sent login code request to {phone}")
@@ -766,6 +770,7 @@ async def submit_code():
         if not code:
             return "<p>Code is required.</p>", 400
         try:
+            # user_client zaten bağlı olmalı, sadece sign_in çağrısı yeterli
             await user_client.sign_in(phone, code)
             logger.info(f"✅ Logged in user-client for {phone}")
             session.pop('phone', None)
@@ -888,7 +893,7 @@ async def admin_callback_handler(event):
             if removable_admins:
                 kb.append([Button.inline("🗑 Admin Kaldır", b"admin_show_remove_admins")])
             kb.append([Button.inline("🔙 Geri", b"admin_home")])
-            return await event.edit("� *Adminleri Yönet*", buttons=kb, link_preview=False)
+            return await event.edit("👤 *Adminleri Yönet*", buttons=kb, link_preview=False)
         if data == 'admin_show_remove_admins':
             admins = await get_admins()
             kb = []
@@ -1225,15 +1230,34 @@ async def main():
             logger.info(f"Ayar {setting_key} zaten mevcut: {current_value}")
 
     logger.info("Telegram istemcileri bağlanıyor...")
-    await user_client.start() # Kullanıcı oturumu ile başla (mesajları okumak için)
+    # user_client'ın oturum dosyasını yüklemeye çalışın, yoksa web arayüzünden giriş yapılması gerekecek.
+    # Bu, EOFError'ı önlemek için önemlidir.
+    try:
+        await user_client.start() 
+        logger.info("Kullanıcı istemcisi başarıyla bağlandı veya oturum yüklendi.")
+    except Exception as e:
+        logger.warning(f"Kullanıcı istemcisi başlatılırken hata oluştu (muhtemelen oturum dosyası yok): {e}")
+        logger.warning("Lütfen botunuzun web arayüzüne giderek (Render URL'nizin sonuna /login ekleyerek) Telegram hesabınızla giriş yapın.")
+        # Botun diğer kısımlarının çalışmaya devam etmesi için burada hata fırlatmayın,
+        # ancak kullanıcıya web arayüzünden giriş yapması gerektiğini bildirin.
+
     await bot_client.start(bot_token=BOT_TOKEN) # Bot oturumu ile başla (mesaj göndermek için)
-    logger.info("Telegram istemcileri bağlandı.")
+    logger.info("Telegram bot istemcisi bağlandı.")
 
     # Botun kendisiyle ilgili bilgileri logla
     me_bot = await bot_client.get_me()
-    me_user = await user_client.get_me()
+    me_user = None
+    try:
+        me_user = await user_client.get_me()
+    except Exception as e:
+        logger.warning(f"Kullanıcı istemcisi bilgileri alınamadı (belki henüz giriş yapılmadı): {e}")
+
     logger.info(f"Otomatik Alım/Satım Botu: @{me_bot.username} ({me_bot.id})")
-    logger.info(f"Kullanıcı İstemcisi (kanalları okumak için): @{me_user.username} ({me_user.id})")
+    if me_user:
+        logger.info(f"Kullanıcı İstemcisi (kanalları okumak için): @{me_user.username} ({me_user.id})")
+    else:
+        logger.info("Kullanıcı İstemcisi henüz bağlı değil.")
+
 
     logger.info(f"Otomatik Alım/Satım Botu şu anda kanal ID'sini dinliyor: {SOURCE_CHANNEL_ID}")
     logger.info(f"Otomatik Alım Miktarı: {await get_bot_setting('buy_amount_sol')} SOL")
@@ -1254,7 +1278,9 @@ async def main():
     logger.info("Flask web sunucusu başlatıldı.")
 
     logger.info("Bot çalışıyor. Durdurmak için Ctrl+C tuşlarına basın.")
-    await user_client.run_until_disconnected()
+    # user_client'ın bağlantısının kesilmesini bekleyin, ancak eğer zaten bağlı değilse hata vermeyin.
+    if user_client.is_connected():
+        await user_client.run_until_disconnected()
     await bot_client.run_until_disconnected()
 
 if __name__ == '__main__':
@@ -1264,4 +1290,3 @@ if __name__ == '__main__':
         logger.info("Bot kullanıcı tarafından durduruldu.")
     except Exception as e:
         logger.critical(f"Beklenmeyen bir hata oluştu: {e}", exc_info=True)
-
