@@ -14,12 +14,13 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from flask import Flask, jsonify, request, redirect, session, render_template_string
 import threading
 from datetime import datetime
+import base64 # Yeni eklendi: Base64 kod çözme için
 
 # Solana Kütüphaneleri
 from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
-from solders.pubkey import Pubkey # Pubkey sınıfı import edildi
+from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction
@@ -403,6 +404,9 @@ async def remove_open_position(contract_address):
     await asyncio.to_thread(remove_open_position_sync, contract_address)
 
 async def add_transaction_history(*args):
+    # args'ı doğrudan add_transaction_history_sync'e iletiyoruz.
+    # Bu wrapper fonksiyonu, add_transaction_history_sync'in beklediği tüm argümanları doğru sırada almalıdır.
+    # error_message'ın pozisyonel olarak geçirilmesi gerekiyor.
     await asyncio.to_thread(add_transaction_history_sync, *args)
 
 async def get_transaction_history():
@@ -471,16 +475,16 @@ def extract_token_name_from_message(text: str) -> str:
     return "unknown"
 
 # --- Solana Auto-Buy Fonksiyonları ---
-async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001): # String olarak al
+async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001):
     """Belirli bir token'ın anlık SOL fiyatını tahmin eder."""
     if not solana_client:
         logger.error("Solana client not initialized. Cannot get token price.")
         return None
 
     try:
-        token_mint = Pubkey.from_string(token_mint_str) # from_string kullan
+        token_mint = Pubkey.from_string(token_mint_str)
         input_mint = token_mint
-        output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112") # from_string kullan
+        output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
 
         token_info = await asyncio.to_thread(solana_client.get_token_supply, token_mint)
         if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
@@ -558,7 +562,8 @@ async def perform_swap(quote_data: dict):
             return False, "Invalid swap transaction data.", None
 
         serialized_tx = swap_data["swapTransaction"]
-        transaction = VersionedTransaction.from_bytes(bytes(serialized_tx, 'base64')) # await asyncio.to_thread kaldırıldı, bu işlem CPU bound
+        # Base64 string'i byte'a dönüştürmek için base64.b64decode kullanıldı
+        transaction = VersionedTransaction.from_bytes(base64.b64decode(serialized_tx))
         
         transaction.sign([payer_keypair])
 
@@ -594,8 +599,8 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
         logger.info(f"Contract {contract_address} already processed for auto-buy. Skipping.")
         return False, "Contract already processed.", None, None
 
-    input_mint = Pubkey.from_string("So11111111111111111111111111111111111111112") # from_string kullan
-    output_mint = Pubkey.from_string(contract_address) # from_string kullan
+    input_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
+    output_mint = Pubkey.from_string(contract_address)
     amount_in_lamports = int(buy_amount_sol * 10**9)
     slippage_bps = int(slippage_tolerance_percent * 100)
 
@@ -603,9 +608,10 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
 
     quote_data = await get_swap_quote(input_mint, output_mint, amount_in_lamports, slippage_bps)
     if not quote_data:
+        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'buy', token_name, contract_address,
-            buy_amount_sol, 0.0, 0.0, 'failed', error_message="Failed to get swap quote."
+            buy_amount_sol, 0.0, 0.0, 'failed', "Failed to get swap quote."
         )
         logger.error(f"Failed to get swap quote for {contract_address}.")
         return False, "Failed to get swap quote.", None, None
@@ -631,9 +637,10 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
         logger.info(f"Successfully auto-bought token {contract_address}. Tx: {tx_signature}")
         return True, f"Successfully bought token {token_name}. Tx: {tx_signature}", actual_buy_price_sol, bought_amount_token
     else:
+        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'buy', token_name, contract_address,
-            buy_amount_sol, 0.0, 0.0, 'failed', error_message=tx_signature
+            buy_amount_sol, 0.0, 0.0, 'failed', tx_signature # tx_signature burada hata mesajı
         )
         logger.error(f"Failed to auto-buy token {contract_address}: {tx_signature}")
         return False, f"Failed to buy token {token_name}: {tx_signature}", None, None
@@ -644,15 +651,16 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
         logger.error("Auto-sell skipped: Solana client or wallet not initialized.")
         return False, "Wallet not ready."
 
-    input_mint = Pubkey.from_string(contract_address) # from_string kullan
-    output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112") # from_string kullan
+    input_mint = Pubkey.from_string(contract_address)
+    output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
     slippage_bps = int(slippage_tolerance_percent * 100)
 
     token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint)
     if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
+        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', error_message="Could not get token decimals for selling."
+            0.0, amount_to_sell_token, 0.0, 'failed', "Could not get token decimals for selling."
         )
         logger.warning(f"Could not get token supply info for {token_name}. Cannot determine decimals for selling.")
         return False, "Could not get token decimals."
@@ -664,9 +672,10 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
 
     quote_data = await get_swap_quote(input_mint, output_mint, amount_in_lamports, slippage_bps)
     if not quote_data:
+        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', error_message="Failed to get swap quote for selling."
+            0.0, amount_to_sell_token, 0.0, 'failed', "Failed to get swap quote for selling."
         )
         logger.error(f"Failed to get swap quote for selling {token_name}.")
         return False, "Failed to get swap quote for selling."
@@ -684,9 +693,10 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
         logger.info(f"Successfully auto-sold token {token_name}. Tx: {tx_signature}")
         return True, f"Successfully sold token {token_name}. Tx: {tx_signature}"
     else:
+        # error_message'ı pozisyonel argüman olarak geçirin
         await add_transaction_history(
             "N/A", 'sell', token_name, contract_address,
-            0.0, amount_to_sell_token, 0.0, 'failed', error_message=tx_signature
+            0.0, amount_to_sell_token, 0.0, 'failed', tx_signature
         )
         logger.error(f"Failed to auto-sell token {token_name}: {tx_signature}")
         return False, f"Failed to sell token {token_name}: {tx_signature}"
@@ -721,7 +731,7 @@ async def monitor_positions_task():
             target_profit_x = pos['target_profit_x']
             stop_loss_percent = pos['stop_loss_percent']
 
-            current_price_sol = await get_current_token_price_sol(contract_address) # String olarak geçir
+            current_price_sol = await get_current_token_price_sol(contract_address)
             if current_price_sol is None:
                 logger.warning(f"Could not get current price for {token_name}. Skipping monitoring for this position.")
                 continue
@@ -809,7 +819,7 @@ async def admin_callback_handler(event):
             await event.answer('🛑 Bot durduruldu.')
             return await event.edit("🛑 *Bot kapatıldı.*",
                                     buttons=[[Button.inline("🔄 Botu Başlat (çalışır duruma getir)", b"admin_start")],
-                                             [Button.inline("🔙 Geri", b"admin_home")]],
+                                             [Button.inline("� Geri", b"admin_home")]],
                                     link_preview=False)
         
         if data == 'admin_auto_trade_settings':
