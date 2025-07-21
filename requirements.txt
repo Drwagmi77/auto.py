@@ -2,4 +2,4 @@ telethon
 solana
 requests
 psycopg2-binary
-Flask
+Flask[async]
