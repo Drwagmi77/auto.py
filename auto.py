@@ -17,8 +17,8 @@ import threading
 # Solana Kütüphaneleri
 from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
-from solders.keypair import Keypair # Buradaki import yolu güncellendi
-from solana.publickey import PublicKey
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey # Buradaki import yolu güncellendi (PublicKey yerine Pubkey)
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction
@@ -434,7 +434,7 @@ def extract_token_name_from_message(text: str) -> str:
     return "unknown"
 
 # --- Solana Auto-Buy Fonksiyonları ---
-async def get_current_token_price_sol(token_mint: PublicKey, amount_token_to_check: float = 0.000000001):
+async def get_current_token_price_sol(token_mint: Pubkey, amount_token_to_check: float = 0.000000001):
     """
     Belirli bir token'ın anlık SOL fiyatını tahmin eder.
     Küçük bir miktar token'ı SOL'a takas etme teklifi alarak fiyatı bulur.
@@ -446,7 +446,7 @@ async def get_current_token_price_sol(token_mint: PublicKey, amount_token_to_che
     try:
         # Token'dan SOL'a takas teklifi al
         input_mint = token_mint
-        output_mint = PublicKey("So11111111111111111111111111111111111111112") # SOL mint address
+        output_mint = Pubkey("So11111111111111111111111111111111111111112") # SOL mint address
 
         # Token'ın decimal sayısını al
         token_info = await asyncio.to_thread(solana_client.get_token_supply, token_mint)
@@ -479,7 +479,7 @@ async def get_current_token_price_sol(token_mint: PublicKey, amount_token_to_che
         logger.error(f"Unexpected error in get_current_token_price_sol: {e}")
         return None
 
-async def get_swap_quote(input_mint: PublicKey, output_mint: PublicKey, amount_in_lamports: int, slippage_bps: int):
+async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamports: int, slippage_bps: int):
     """Jupiter Aggregator'dan takas teklifi alır."""
     if not solana_client or not payer_keypair:
         logger.error("Solana client or payer keypair not initialized. Cannot get quote.")
@@ -567,8 +567,8 @@ async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol:
         logger.info(f"Contract {contract_address} already processed for auto-buy. Skipping.")
         return False, "Contract already processed.", None, None
 
-    input_mint = PublicKey("So11111111111111111111111111111111111111112") # SOL mint address
-    output_mint = PublicKey(contract_address)
+    input_mint = Pubkey("So11111111111111111111111111111111111111112") # SOL mint address
+    output_mint = Pubkey(contract_address)
     amount_in_lamports = int(buy_amount_sol * 10**9) # SOL'u lamports'a çevir
     slippage_bps = int(slippage_tolerance_percent * 100) # Yüzdeyi basis points'e çevir (örn: %5 -> 500)
 
@@ -607,8 +607,8 @@ async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell
         logger.error("Auto-sell skipped: Solana client or wallet not initialized.")
         return False, "Wallet not ready."
 
-    input_mint = PublicKey(contract_address)
-    output_mint = PublicKey("So11111111111111111111111111111111111111112") # SOL mint address
+    input_mint = Pubkey(contract_address)
+    output_mint = Pubkey("So11111111111111111111111111111111111111112") # SOL mint address
     slippage_bps = int(slippage_tolerance_percent * 100)
 
     # Token'ın decimal sayısını al
@@ -665,7 +665,7 @@ async def monitor_positions_task():
             target_profit_x = pos['target_profit_x']
             stop_loss_percent = pos['stop_loss_percent']
 
-            current_price_sol = await get_current_token_price_sol(PublicKey(contract_address))
+            current_price_sol = await get_current_token_price_sol(Pubkey(contract_address))
             if current_price_sol is None:
                 logger.warning(f"Could not get current price for {token_name}. Skipping monitoring for this position.")
                 continue
@@ -888,7 +888,7 @@ async def admin_callback_handler(event):
             if removable_admins:
                 kb.append([Button.inline("🗑 Admin Kaldır", b"admin_show_remove_admins")])
             kb.append([Button.inline("🔙 Geri", b"admin_home")])
-            return await event.edit("👤 *Adminleri Yönet*", buttons=kb, link_preview=False)
+            return await event.edit("� *Adminleri Yönet*", buttons=kb, link_preview=False)
         if data == 'admin_show_remove_admins':
             admins = await get_admins()
             kb = []
