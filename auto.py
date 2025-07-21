@@ -15,70 +15,81 @@ from flask import Flask, jsonify, request, redirect, session, render_template_st
 import threading
 from datetime import datetime
 import base64 # Base64 decoding
-from cachetools import TTLCache # Cache için eklendi# Solana Kütüphaneleri
+
+# Solana Kütüphaneleri
 from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction
+from solders.transaction import VersionedTransaction 
 from solders.message import MessageV0
 from solders.instruction import Instruction
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
-from solders.rpc.responses import GetBalanceResp, GetBlockHeightResp
-from solders.hash import Hash
-from solders.signature import Signature
-from solders.system_program import transfer
-from solders.transaction_status import TransactionConfirmationStatus# --- Ortam Değişkenleri ---
+from solders.rpc.responses import GetBalanceResp # GetBalanceResp nesnesini işlemek için hala gerekli
+
+# --- Ortam Değişkenleri ---
 DB_NAME = os.environ.get("DB_NAME", "your_db_name")
 DB_USER = os.environ.get("DB_USER", "your_db_user")
 DB_PASS = os.environ.get("DB_PASS")
 DB_HOST = os.environ.get("DB_HOST", "localhost")
-DB_PORT = os.environ.get("DB_PORT", "5432")BOT_TOKEN = os.environ.get("BOT_TOKEN")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")SOURCE_CHANNEL_ID = int(os.environ.get("SOURCE_CHANNEL_ID"))SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
-JUPITER_API_URL = os.environ.get("JUPITER_API_URL", "https://quote-api.jup.ag/v6")SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(24).hex())app = Flask(__name__)
-app.secret_key = SECRET_KEY# --- Telethon İstemcileri ---
-bot_client = TelegramClient('auto_buy_bot_session', API_ID, API_HASH)# --- Solana İstemci ve Cüzdan Başlatma ---
+API_HASH = os.environ.get("API_HASH")
+
+SOURCE_CHANNEL_ID = int(os.environ.get("SOURCE_CHANNEL_ID")) 
+
+SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY") 
+SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+JUPITER_API_URL = os.environ.get("JUPITER_API_URL", "https://quote-api.jup.ag/v6")
+
+SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(24).hex())
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# --- Telethon İstemcileri ---
+bot_client = TelegramClient('auto_buy_bot_session', API_ID, API_HASH)
+
+# --- Solana İstemci ve Cüzdan Başlatma ---
 solana_client = None
-payer_keypair = None# Denenecek RPC uç noktaları listesi (Helius RPC ile güncellendi)
+payer_keypair = None
+
+# Denenecek RPC uç noktaları listesi (güncellendi)
 RPC_ENDPOINTS = [
-    "https://mainnet.helius-rpc.com/?api-key=7930dbab-e806-4f3f-bf3b-716a14c6e3c3", # Helius Mainnet RPC
-    "https://api.mainnet-beta.solana.com", # Yedek olarak genel RPC
+    "https://api.mainnet-beta.solana.com",
     "https://solana-rpc.web3auth.io",
     "https://ssc-dao.genesysgo.net",
     "https://rpc.ankr.com/solana",
     "https://solana-mainnet.rpc.extrnode.com"
-]# Aktif RPC URL'sini tutmak için global değişken
-active_rpc_url = None# Jupiter API çağrıları için global kilit ve rate limit
-jupiter_api_lock = asyncio.Lock()
-last_jupiter_call_time = 0
-JUPITER_RATE_LIMIT_DELAY = 2.0 # Her Jupiter API çağrısı arasında en az 2.0 saniye bekle (artırıldı)# Jupiter API çağrıları için Semaphore (eşzamanlı istekleri sınırlamak için)
-JUPITER_SEMAPHORE = asyncio.Semaphore(3) # Maksimum 3 eşzamanlı Jupiter API isteği# Jupiter teklifleri için cache (5 dakika TTL'li, 100 token sakla)
-QUOTE_CACHE = TTLCache(maxsize=100, ttl=300)async def get_healthy_client():
+]
+
+async def get_healthy_client():
     """
     Önceden tanımlanmış bir listeden sağlıklı bir Solana RPC uç noktasına bağlanmaya çalışır.
     Başarılı olursa bir Client nesnesi, aksi takdirde None döndürür.
     """
-    global active_rpc_url
     for url in RPC_ENDPOINTS:
         try:
             logger.info(f"RPC URL test ediliyor: {url}")
-            client = Client(url)        # Sağlık kontrolü için get_block_height() kullanılıyor
-        # Bu, RPC'nin temel bir isteğe yanıt verip vermediğini kontrol eder.
-        block_height_resp = await asyncio.to_thread(client.get_block_height)
-        
-        # GetBlockHeightResp nesnesini ve değerini kontrol et
-        if isinstance(block_height_resp, GetBlockHeightResp) and block_height_resp.value is not None and block_height_resp.value > 0:
-            logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Blok yüksekliği: {block_height_resp.value}")
-            active_rpc_url = url # Aktif URL'yi kaydet
-            return client
-        else:
-            logger.warning(f"RPC {url} sağlıksız görünüyor veya geçersiz blok yüksekliği döndürdü: {block_height_resp}")
-    except Exception as e:
-        logger.warning(f"RPC {url} bağlantısı başarısız: {str(e)}")
-logger.error("Tüm RPC uç noktaları başarısız oldu.")
-active_rpc_url = None # Sağlıklı RPC bulunamadı
-return Noneasync def get_balance_with_retry(pubkey: Pubkey, retries=3):
+            client = Client(url)
+            
+            # Sağlık kontrolü için get_block_height() kullanılıyor
+            # Bu, RPC'nin temel bir isteğe yanıt verip vermediğini kontrol eder.
+            block_height = await asyncio.to_thread(client.get_block_height)
+            
+            if isinstance(block_height, int) and block_height > 0:
+                logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Blok yüksekliği: {block_height}")
+                return client
+            else:
+                logger.warning(f"RPC {url} sağlıksız görünüyor veya geçersiz blok yüksekliği döndürdü: {block_height}")
+        except Exception as e:
+            logger.warning(f"RPC {url} bağlantısı başarısız: {str(e)}")
+    logger.error("Tüm RPC uç noktaları başarısız oldu.")
+    return None
+
+async def get_balance_with_retry(pubkey: Pubkey, retries=3):
     """
     Solana bakiyesini bir yeniden deneme mekanizmasıyla alır.
     GetBalanceResp nesnesini işler.
@@ -86,71 +97,74 @@ return Noneasync def get_balance_with_retry(pubkey: Pubkey, retries=3):
     for i in range(retries):
         try:
             # commitment="confirmed" eklendi
-            resp = await asyncio.to_thread(solana_client.get_balance, pubkey, commitment="confirmed")        # GetBalanceResp nesnesinin değerini doğrudan döndür
-        if isinstance(resp, GetBalanceResp):
-            return resp.value
-        else:
-            logger.warning(f"get_balance için beklenmeyen yanıt türü: {type(resp)}. Tam yanıt: {resp}. Deneme {i+1}/{retries}")
-    except Exception as e:
-        logger.warning(f"Bakiye kontrol denemesi {i+1}/{retries} başarısız oldu: {e}")
-        await asyncio.sleep(1) # Yeniden denemeden önce kısa bir gecikme
-return Noneasync def check_wallet_balance():
+            resp = await asyncio.to_thread(solana_client.get_balance, pubkey, commitment="confirmed")
+            
+            # GetBalanceResp nesnesinin değerini doğrudan döndür
+            if isinstance(resp, GetBalanceResp):
+                return resp.value
+            else:
+                logger.warning(f"get_balance için beklenmeyen yanıt türü: {type(resp)}. Tam yanıt: {resp}. Deneme {i+1}/{retries}")
+        except Exception as e:
+            logger.warning(f"Bakiye kontrol denemesi {i+1}/{retries} başarısız oldu: {e}")
+            await asyncio.sleep(1) # Yeniden denemeden önce kısa bir gecikme
+    return None
+
+async def check_wallet_balance():
     """
     Cüzdanın SOL bakiyesini kontrol eder ve SOL cinsinden döndürür.
     Hata durumunda None döndürür.
     """
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Bakiye kontrol edilemiyor.")
-        return Nonetry:
-    balance_lamports = await get_balance_with_retry(payer_keypair.pubkey())
-    
-    if balance_lamports is None:
-        logger.error("Cüzdan bakiyesi alınamadı.")
         return None
-        
-    return balance_lamports / 10**9  # SOL cinsinden
-except Exception as e:
-    logger.error(f"Bakiye kontrol hatası: {str(e)}", exc_info=True)
-    return Noneasync def init_solana_client():
-    """Solana RPC istemcisini ve cüzdanı başlatır."""
-    global solana_client, payer_keypair# Reset them at the start to ensure clean state for re-initialization
-solana_client = None
-payer_keypair = None
-
-try:
-    client_temp = await get_healthy_client()
-    if not client_temp:
-        logger.critical("Sağlıklı RPC bulunamadı! Solana istemcisi başlatılamadı.")
-        return # solana_client and payer_keypair remain None
-
-    priv_key = await get_bot_setting("SOLANA_PRIVATE_KEY")
-    if not priv_key:
-        logger.error("Özel anahtar ayarlanmamış! Otomatik alım-satım işlevleri devre dışı bırakılacak.")
-        return # payer_keypair remains None
-
+    
     try:
-        keypair_temp = Keypair.from_base58_string(priv_key)
-        solana_client = client_temp # Only assign if keypair is successfully created
-        payer_keypair = keypair_temp # Only assign if keypair is successfully created
-
-        logger.info(f"Cüzdan başlatıldı: {payer_keypair.pubkey()}")
-        logger.info(f"Aktif RPC URL'si: {active_rpc_url if active_rpc_url else 'Bilinmiyor'}")
-
-        # Bakiye kontrolü (this can fail without invalidating the client/keypair)
-        balance = await check_wallet_balance()
-        logger.info(f"Başlangıç bakiyesi: {balance if balance is not None else 'Alınamadı'} SOL")
-
+        balance_lamports = await get_balance_with_retry(payer_keypair.pubkey())
+        
+        if balance_lamports is None:
+            logger.error("Cüzdan bakiyesi alınamadı.")
+            return None
+            
+        return balance_lamports / 10**9  # SOL cinsinden
     except Exception as e:
-        logger.error(f"Özel anahtardan ödeme anahtar çifti başlatılırken hata: {e}", exc_info=True)
-        # If keypair creation fails, ensure they remain None
+        logger.error(f"Bakiye kontrol hatası: {str(e)}", exc_info=True)
+        return None
+
+async def init_solana_client():
+    """Solana RPC istemcisini ve cüzdanı başlatır."""
+    global solana_client, payer_keypair
+    try:
+        solana_client = await get_healthy_client()
+        if not solana_client:
+            logger.critical("Sağlıklı RPC bulunamadı!")
+            solana_client = None
+            payer_keypair = None 
+            return
+
+        priv_key = await get_bot_setting("SOLANA_PRIVATE_KEY")
+        if not priv_key:
+            logger.error("Özel anahtar ayarlanmamış! Otomatik alım-satım işlevleri devre dışı bırakılacak.")
+            payer_keypair = None 
+            return
+
+        try:
+            payer_keypair = Keypair.from_base58_string(priv_key)
+            logger.info(f"Cüzdan başlatıldı: {payer_keypair.pubkey()}")
+            logger.info(f"Aktif RPC URL'si: {solana_client.endpoint_uri}")
+
+            # Bakiye kontrolü
+            balance = await check_wallet_balance()
+            logger.info(f"Başlangıç bakiyesi: {balance if balance is not None else 'Alınamadı'} SOL")
+
+        except Exception as e:
+            logger.error(f"Özel anahtardan ödeme anahtar çifti başlatılırken hata: {e}", exc_info=True)
+            payer_keypair = None 
+    except Exception as e:
+        logger.error(f"Solana istemcisi başlatma hatası: {str(e)}", exc_info=True)
         solana_client = None
         payer_keypair = None
-        return # Exit if keypair initialization fails
 
-except Exception as e:
-    # This outer catch is for errors during get_healthy_client or get_bot_setting
-    logger.error(f"Solana istemcisi başlatma hatası: {str(e)}", exc_info=True)
-    # solana_client and payer_keypair are already None from the start or from inner except# --- Veritabanı Bağlantısı ve Yönetim Fonksiyonları (PostgreSQL) ---
+# --- Veritabanı Bağlantısı ve Yönetim Fonksiyonları (PostgreSQL) ---
 def get_connection():
     """Bir PostgreSQL veritabanı bağlantısı sağlar."""
     try:
@@ -164,7 +178,9 @@ def get_connection():
         )
     except psycopg2.OperationalError as e:
         logger.error(f"Veritabanı bağlantısı başarısız oldu: {e}")
-        raise edef init_db_sync():
+        raise e
+
+def init_db_sync():
     """Veritabanı tablolarını oluşturur (eğer yoksa)."""
     conn = None
     try:
@@ -225,7 +241,9 @@ def get_connection():
         raise
     finally:
         if conn:
-            conn.close()def get_admins_sync():
+            conn.close()
+
+def get_admins_sync():
     conn = None
     try:
         conn = get_connection()
@@ -238,7 +256,9 @@ def get_connection():
         return {}
     finally:
         if conn:
-            conn.close()def add_admin_sync(user_id, first_name, last_name="", lang="en", is_default=False):
+            conn.close()
+
+def add_admin_sync(user_id, first_name, last_name="", lang="en", is_default=False):
     conn = None
     try:
         conn = get_connection()
@@ -256,7 +276,9 @@ def get_connection():
         logger.error(f"Yönetici {user_id} eklenirken hata: {e}")
     finally:
         if conn:
-            conn.close()def remove_admin_sync(user_id):
+            conn.close()
+
+def remove_admin_sync(user_id):
     admins = get_admins_sync()
     if admins.get(user_id, {}).get("is_default"):
         logger.warning(f"Varsayılan yönetici {user_id} kaldırılmaya çalışıldı.")
@@ -272,7 +294,9 @@ def get_connection():
         logger.error(f"Yönetici {user_id} kaldırılırken hata: {e}")
     finally:
         if conn:
-            conn.close()def get_bot_setting_sync(setting):
+            conn.close()
+
+def get_bot_setting_sync(setting):
     conn = None
     try:
         conn = get_connection()
@@ -285,7 +309,9 @@ def get_connection():
         return None
     finally:
         if conn:
-            conn.close()def set_bot_setting_sync(setting, value):
+            conn.close()
+
+def set_bot_setting_sync(setting, value):
     conn = None
     try:
         conn = get_connection()
@@ -298,7 +324,7 @@ def get_connection():
         conn.commit()
         if cur.rowcount > 0:
             # Özel anahtar ise maskele
-            if setting == "SOLANA_PRIVATE_KEY" or setting == "JUPITER_API_KEY":
+            if setting == "SOLANA_PRIVATE_KEY":
                 logger.info(f"Bot ayarı '{setting}' ayarlandı. Değer güvenlik için maskelendi.")
             else:
                 logger.info(f"Bot ayarı '{setting}' '{value}' olarak ayarlandı.")
@@ -306,7 +332,9 @@ def get_connection():
         logger.error(f"Bot ayarı '{setting}' ayarlanırken hata: {e}")
     finally:
         if conn:
-            conn.close()def is_contract_processed_sync(contract_address):
+            conn.close()
+
+def is_contract_processed_sync(contract_address):
     conn = None
     try:
         conn = get_connection()
@@ -319,7 +347,9 @@ def get_connection():
         return False
     finally:
         if conn:
-            conn.close()def record_processed_contract_sync(contract_address):
+            conn.close()
+
+def record_processed_contract_sync(contract_address):
     conn = None
     try:
         conn = get_connection()
@@ -335,7 +365,9 @@ def get_connection():
         logger.error(f"İşlenmiş sözleşme {contract_address} kaydedilirken hata: {e}")
     finally:
         if conn:
-            conn.close()def add_open_position_sync(contract_address, token_name, buy_price_sol, buy_amount_token, buy_tx_signature, target_profit_x, stop_loss_percent):
+            conn.close()
+
+def add_open_position_sync(contract_address, token_name, buy_price_sol, buy_amount_token, buy_tx_signature, target_profit_x, stop_loss_percent):
     conn = None
     try:
         conn = get_connection()
@@ -358,7 +390,9 @@ def get_connection():
         logger.error(f"{contract_address} için açık pozisyon eklenirken/güncellenirken hata: {e}")
     finally:
         if conn:
-            conn.close()def get_open_positions_sync():
+            conn.close()
+
+def get_open_positions_sync():
     conn = None
     try:
         conn = get_connection()
@@ -370,7 +404,9 @@ def get_connection():
         return []
     finally:
         if conn:
-            conn.close()def remove_open_position_sync(contract_address):
+            conn.close()
+
+def remove_open_position_sync(contract_address):
     conn = None
     try:
         conn = get_connection()
@@ -385,7 +421,9 @@ def get_connection():
         logger.error(f"{contract_address} için açık pozisyon kaldırılırken hata: {e}")
     finally:
         if conn:
-            conn.close()def add_transaction_history_sync(tx_signature, tx_type, token_name, contract_address, amount_sol, amount_token, price_sol_per_token, status, error_message=None):
+            conn.close()
+
+def add_transaction_history_sync(tx_signature, tx_type, token_name, contract_address, amount_sol, amount_token, price_sol_per_token, status, error_message=None):
     conn = None
     try:
         conn = get_connection()
@@ -401,7 +439,9 @@ def get_connection():
         logger.error(f"{tx_signature} için işlem geçmişi kaydedilirken hata: {e}")
     finally:
         if conn:
-            conn.close()def get_transaction_history_sync():
+            conn.close()
+
+def get_transaction_history_sync():
     conn = None
     try:
         conn = get_connection()
@@ -413,40 +453,65 @@ def get_connection():
         return []
     finally:
         if conn:
-            conn.close()# --- Asenkron Veritabanı Fonksiyonları Sarmalayıcıları ---
+            conn.close()
+
+# --- Asenkron Veritabanı Fonksiyonları Sarmalayıcıları ---
 async def init_db():
-    await asyncio.to_thread(init_db_sync)async def get_admins():
-    return await asyncio.to_thread(get_admins_sync)async def add_admin(user_id, first_name, last_name="", lang="en", is_default=False):
-    await asyncio.to_thread(add_admin_sync, user_id, first_name, last_name, lang, is_default)async def remove_admin(user_id):
-    await asyncio.to_thread(remove_admin_sync, user_id)async def get_bot_setting(setting):
+    await asyncio.to_thread(init_db_sync)
+
+async def get_admins():
+    return await asyncio.to_thread(get_admins_sync)
+
+async def add_admin(user_id, first_name, last_name="", lang="en", is_default=False):
+    await asyncio.to_thread(add_admin_sync, user_id, first_name, last_name, lang, is_default)
+
+async def remove_admin(user_id):
+    await asyncio.to_thread(remove_admin_sync, user_id)
+
+async def get_bot_setting(setting):
     val = await asyncio.to_thread(get_bot_setting_sync, setting)
-    # Eğer ayar veritabanında yoksa ve ortam değişkeni olarak ayarlanmışsa onu kullan
-    if val is None:
-        if setting == "SOLANA_PRIVATE_KEY":
-            return os.environ.get("SOLANA_PRIVATE_KEY")
-        elif setting == "JUPITER_API_KEY":
-            return os.environ.get("JUPITER_API_KEY")
-    return val if val is not None else DEFAULT_BOT_SETTINGS.get(setting)async def set_bot_setting(setting, value):
-    await asyncio.to_thread(set_bot_setting_sync, setting, value)async def is_contract_processed(contract_address):
-    return await asyncio.to_thread(is_contract_processed_sync, contract_address)async def record_processed_contract(contract_address):
-    await asyncio.to_thread(record_processed_contract_sync, contract_address)async def add_open_position(contract_address, token_name, buy_price_sol, buy_amount_token, buy_tx_signature, target_profit_x, stop_loss_percent):
-    await asyncio.to_thread(add_open_position_sync, contract_address, token_name, buy_price_sol, buy_amount_token, buy_tx_signature, target_profit_x, stop_loss_percent)async def get_open_positions():
-    return await asyncio.to_thread(get_open_positions_sync)async def remove_open_position(contract_address):
-    await asyncio.to_thread(remove_open_position_sync, contract_address)async def add_transaction_history(*args):
-    await asyncio.to_thread(add_transaction_history_sync, *args)async def get_transaction_history():
-    return await asyncio.to_thread(get_transaction_history_sync)# --- Varsayılan Ayarlar ---
-DEFAULT_ADMIN_ID = int(os.environ.get("DEFAULT_ADMIN_ID", "YOUR_TELEGRAM_USER_ID"))
+    if setting == "SOLANA_PRIVATE_KEY" and val is None:
+        return os.environ.get("SOLANA_PRIVATE_KEY")
+    return val if val is not None else DEFAULT_BOT_SETTINGS.get(setting)
+
+async def set_bot_setting(setting, value):
+    await asyncio.to_thread(set_bot_setting_sync, setting, value)
+
+async def is_contract_processed(contract_address):
+    return await asyncio.to_thread(is_contract_processed_sync, contract_address)
+
+async def record_processed_contract(contract_address):
+    await asyncio.to_thread(record_processed_contract_sync, contract_address)
+
+async def add_open_position(contract_address, token_name, buy_price_sol, buy_amount_token, buy_tx_signature, target_profit_x, stop_loss_percent):
+    await asyncio.to_thread(add_open_position_sync, contract_address, token_name, buy_price_sol, buy_amount_token, buy_tx_signature, target_profit_x, stop_loss_percent)
+
+async def get_open_positions():
+    return await asyncio.to_thread(get_open_positions_sync)
+
+async def remove_open_position(contract_address):
+    await asyncio.to_thread(remove_open_position_sync, contract_address)
+
+async def add_transaction_history(*args):
+    await asyncio.to_thread(add_transaction_history_sync, *args)
+
+async def get_transaction_history():
+    return await asyncio.to_thread(get_transaction_history_sync)
+
+# --- Varsayılan Ayarlar ---
+DEFAULT_ADMIN_ID = int(os.environ.get("DEFAULT_ADMIN_ID", "YOUR_TELEGRAM_USER_ID")) 
 DEFAULT_BOT_SETTINGS = {
     "bot_status": "running",
     "auto_buy_enabled": "enabled",
     "buy_amount_sol": "0.05",
-    "slippage_tolerance": "5", # bps cinsinden %0.05
+    "slippage_tolerance": "5",
     "auto_sell_enabled": "enabled",
     "profit_target_x": "5.0",
     "stop_loss_percent": "50.0",
-    "SOLANA_PRIVATE_KEY": os.environ.get("SOLANA_PRIVATE_KEY", ""),
-    "JUPITER_API_KEY": os.environ.get("JUPITER_API_KEY", "") # Yeni Jupiter API Anahtarı ayarı
-}# --- Loglama Kurulumu ---
+    "SOLANA_PRIVATE_KEY": os.environ.get("SOLANA_PRIVATE_KEY", "")
+}
+
+# --- Loglama Kurulumu ---
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -457,7 +522,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-logger.info(" Otomatik Alım-Satım Botu Loglama kurulumu tamamlandı. Bot başlatılıyor...")# --- Telethon Yardımcı Fonksiyonları ---
+logger.info("🔥 Otomatik Alım-Satım Botu Loglama kurulumu tamamlandı. Bot başlatılıyor...")
+
+# --- Telethon Yardımcı Fonksiyonları ---
 async def retry_telethon_call(coro, max_retries=5, base_delay=1.0):
     """Telethon çağrıları için yeniden deneme mekanizması."""
     for i in range(max_retries):
@@ -471,10 +538,14 @@ async def retry_telethon_call(coro, max_retries=5, base_delay=1.0):
             else:
                 logger.error(f"Telethon çağrısı için maksimum yeniden deneme sayısına ulaşıldı: {e}")
                 raise
-    raise RuntimeError("Yeniden deneme mantığı başarısız oldu veya max_retries 0 idi")def extract_contract(text: str) -> str | None:
+    raise RuntimeError("Yeniden deneme mantığı başarısız oldu veya max_retries 0 idi")
+
+def extract_contract(text: str) -> str | None:
     """Metinden Solana sözleşme adresini (Base58, 32-44 karakter) çıkarır."""
     m = re.findall(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b", text)
-    return m[0] if m else Nonedef extract_token_name_from_message(text: str) -> str:
+    return m[0] if m else None
+
+def extract_token_name_from_message(text: str) -> str:
     """Mesajdan token adını ($TOKEN_NAME formatında) çıkarır."""
     lines = text.strip().splitlines()
     if not lines:
@@ -487,1249 +558,963 @@ async def retry_telethon_call(coro, max_retries=5, base_delay=1.0):
             logger.debug(f"Çıkarılan token: '{token}' satırdan: '{line}'")
             return token
     logger.debug("Mesajda geçerli bir token ($WORD) bulunamadı; 'unknown' döndürülüyor.")
-    return "unknown"# --- Solana Otomatik Alım Fonksiyonları ---
-async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001, max_retries=7, initial_delay=3.0):
-    """Belirli bir token'ın mevcut SOL fiyatını tahmin eder, yeniden deneme ile."""
-    global last_jupiter_call_timeif not solana_client:
-    logger.error("Solana istemcisi başlatılmadı. Token fiyatı alınamıyor.")
-    return None
+    return "unknown"
 
-async with JUPITER_SEMAPHORE: # Semaphore kullanımı
-    async with jupiter_api_lock:
-        # Rate limit gecikmesini uygula
-        elapsed_time = time.time() - last_jupiter_call_time
-        if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
-            await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
+# --- Solana Otomatik Alım Fonksiyonları ---
+async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check: float = 0.000000001):
+    """Belirli bir token'ın mevcut SOL fiyatını tahmin eder."""
+    if not solana_client:
+        logger.error("Solana istemcisi başlatılmadı. Token fiyatı alınamıyor.")
+        return None
 
-        headers = {}
-        jupiter_api_key = await get_bot_setting("JUPITER_API_KEY")
-        if jupiter_api_key:
-            headers["Authorization"] = f"Bearer {jupiter_api_key}"
+    try:
+        token_mint = Pubkey.from_string(token_mint_str)
+        input_mint = token_mint
+        output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
 
-        for attempt in range(max_retries):
-            try:
-                token_mint = Pubkey.from_string(token_mint_str)
-                input_mint = token_mint
-                output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
+        token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint) 
+        if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
+            logger.warning(f"{token_mint_str} için token arz bilgisi alınamadı. Ondalık basamaklar belirlenemiyor.")
+            return None
+        decimals = token_info.value.decimals
+        
+        amount_in_lamports = int(amount_token_to_check * (10**decimals))
 
-                token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint)
-                if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
-                    logger.warning(f"{token_mint_str} için token arz bilgisi alınamadı. Ondalık basamaklar belirlenemiyor.")
-                    return None
-                decimals = token_info.value.decimals
-                
-                amount_in_lamports = int(amount_token_to_check * (10**decimals))
+        quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps=0"
+        response = requests.get(quote_url)
+        response.raise_for_status()
+        quote_data = response.json()
 
-                quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps=0"
-                
-                response = requests.get(quote_url, headers=headers)
-                response.raise_for_status()
-                quote_data = response.json()
+        if not quote_data or "outAmount" not in quote_data or "inAmount" not in quote_data:
+            logger.warning(f"Fiyat kontrolü için geçersiz teklif verisi: {quote_data}")
+            return None
+        
+        price_sol_per_token = (float(quote_data['outAmount']) / (10**9)) / (float(quote_data['inAmount']) / (10**decimals))
+        logger.debug(f"{token_mint_str} için mevcut fiyat: {price_sol_per_token} SOL/token")
+        return price_sol_per_token
 
-                if not quote_data or "outAmount" not in quote_data or "inAmount" not in quote_data:
-                    logger.warning(f"Fiyat kontrolü için geçersiz teklif verisi: {quote_data}. Deneme {attempt+1}/{max_retries}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
-                    continue
-                
-                price_sol_per_token = (float(quote_data['outAmount']) / (10**9)) / (float(quote_data['inAmount']) / (10**decimals))
-                logger.debug(f"{token_mint_str} için mevcut fiyat: {price_sol_per_token} SOL/token")
-                last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
-                return price_sol_per_token
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Jupiter'den token fiyatı alınırken hata: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"get_current_token_price_sol içinde beklenmeyen hata: {e}")
+        return None
 
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Jupiter'den token fiyatı alınırken hata (deneme {attempt+1}/{max_retries}): {e}")
-                if e.response is not None and e.response.status_code == 429:
-                    # 429 hatası durumunda daha uzun bekle ve yöneticiye bildir
-                    delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
-                    logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
-                    await bot_client.send_message(
-                        DEFAULT_ADMIN_ID,
-                        " **Jupiter API Rate Limit Aşıldı!**\n"
-                        f"Son hata: `{e}`\n"
-                        f"Bot {delay:.2f} saniye bekleyecek.",
-                        parse_mode='md'
-                    )
-                    await asyncio.sleep(delay)
-                elif attempt < max_retries - 1:
-                    # Diğer istek hataları için varsayılan gecikme
-                    await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
-                else:
-                    logger.error(f"Jupiter'den token fiyatı alınırken maksimum yeniden deneme sayısına ulaşıldı: {e}")
-                    return None
-            except Exception as e:
-                logger.error(f"get_current_token_price_sol içinde beklenmeyen hata: {e}", exc_info=True)
-                return None
-        last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
-return Noneasync def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamports: int, slippage_bps: int, max_retries=7, initial_delay=3.0):
-    """Jupiter Aggregator'dan bir takas teklifi alır, yeniden deneme ile."""
-    global last_jupiter_call_time
+async def get_swap_quote(input_mint: Pubkey, output_mint: Pubkey, amount_in_lamports: int, slippage_bps: int):
+    """Jupiter Aggregator'dan bir takas teklifi alır."""
     if not solana_client or not payer_keypair:
         logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Teklif alınamıyor.")
-        return Nonecache_key = f"quote_{input_mint}_{output_mint}_{amount_in_lamports}_{slippage_bps}"
-if cache_key in QUOTE_CACHE:
-    logger.debug(f"Cache'ten teklif alındı: {cache_key}")
-    return QUOTE_CACHE[cache_key]
+        return None
 
-async with JUPITER_SEMAPHORE: # Semaphore kullanımı
-    async with jupiter_api_lock:
-        # Rate limit gecikmesini uygula
-        elapsed_time = time.time() - last_jupiter_call_time
-        if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
-            await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
-
-        headers = {}
-        jupiter_api_key = await get_bot_setting("JUPITER_API_KEY")
-        if jupiter_api_key:
-            headers["Authorization"] = f"Bearer {jupiter_api_key}"
-
-        for attempt in range(max_retries):
-            try:
-                quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps={slippage_bps}"
-                response = requests.get(quote_url, headers=headers)
-                response.raise_for_status()
-                quote_data = response.json()
-                
-                if not quote_data or "swapMode" not in quote_data:
-                    logger.error(f"Geçersiz teklif verisi alındı: {quote_data}. Deneme {attempt+1}/{max_retries}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
-                    continue
-
-                logger.info(f"Jupiter teklifi {input_mint}'ten {output_mint}'e alındı: {quote_data.get('outAmount')} {quote_data.get('outputToken', {}).get('symbol')}")
-                last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
-                QUOTE_CACHE[cache_key] = quote_data # Cache'e ekle
-                return quote_data
-
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Jupiter teklifi alınırken hata (deneme {attempt+1}/{max_retries}): {e}")
-                if e.response is not None and e.response.status_code == 429:
-                    # 429 hatası durumunda daha uzun bekle ve yöneticiye bildir
-                    delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
-                    logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
-                    await bot_client.send_message(
-                        DEFAULT_ADMIN_ID,
-                        " **Jupiter API Rate Limit Aşıldı!**\n"
-                        f"Son hata: `{e}`\n"
-                        f"Bot {delay:.2f} saniye bekleyecek.",
-                        parse_mode='md'
-                    )
-                    await asyncio.sleep(delay)
-                elif attempt < max_retries - 1:
-                    # Diğer istek hataları için varsayılan gecikme
-                    await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
-                else:
-                    logger.error(f"Jupiter teklifi alınırken maksimum yeniden deneme sayısına ulaşıldı: {e}")
-                    return None
-            except Exception as e:
-                logger.error(f"get_swap_quote içinde beklenmeyen hata: {e}", exc_info=True)
-                return None
-        last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
-return Noneasync def get_swap_transaction(quote_response: dict, payer_pubkey: Pubkey, max_retries=7, initial_delay=3.0):
-    """Jupiter Aggregator'dan takas işlemini alır, yeniden deneme ile."""
-    global last_jupiter_call_time
-    if not solana_client or not payer_keypair:
-        logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Takas işlemi alınamıyor.")
-        return Noneasync with JUPITER_SEMAPHORE: # Semaphore kullanımı
-    async with jupiter_api_lock:
-        # Rate limit gecikmesini uygula
-        elapsed_time = time.time() - last_jupiter_call_time
-        if elapsed_time < JUPITER_RATE_LIMIT_DELAY:
-            await asyncio.sleep(JUPITER_RATE_LIMIT_DELAY - elapsed_time)
-
-        headers = {"Content-Type": "application/json"}
-        jupiter_api_key = await get_bot_setting("JUPITER_API_KEY")
-        if jupiter_api_key:
-            headers["Authorization"] = f"Bearer {jupiter_api_key}"
-
-        for attempt in range(max_retries):
-            try:
-                swap_url = f"{JUPITER_API_URL}/swap"
-                payload = {
-                    "quoteResponse": quote_response,
-                    "userPublicKey": str(payer_pubkey),
-                    "wrapUnwrapSOL": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": "auto" # Otomatik önceliklendirme ücreti
-                }
-                response = requests.post(swap_url, headers=headers, json=payload)
-                response.raise_for_status()
-                swap_data = response.json()
-
-                if not swap_data or "swapTransaction" not in swap_data:
-                    logger.error(f"Geçersiz takas işlemi verisi alındı: {swap_data}. Deneme {attempt+1}/{max_retries}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
-                    continue
-
-                logger.info("Jupiter'den takas işlemi başarıyla alındı.")
-                last_jupiter_call_time = time.time() # Başarılı çağrı zamanını güncelle
-                return swap_data
-
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Jupiter takas işlemi alınırken hata (deneme {attempt+1}/{max_retries}): {e}")
-                if e.response is not None and e.response.status_code == 429:
-                    delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
-                    logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
-                    await bot_client.send_message(
-                        DEFAULT_ADMIN_ID,
-                        " **Jupiter API Rate Limit Aşıldı!**\n"
-                        f"Son hata: `{e}`\n"
-                        f"Bot {delay:.2f} saniye bekleyecek.",
-                        parse_mode='md'
-                    )
-                    await asyncio.sleep(delay)
-                elif attempt < max_retries - 1:
-                    await asyncio.sleep(initial_delay * (2 ** attempt) + random.uniform(0, 1))
-                else:
-                    logger.error(f"Jupiter takas işlemi alınırken maksimum yeniden deneme sayısına ulaşıldı: {e}")
-                    return None
-            except Exception as e:
-                logger.error(f"get_swap_transaction içinde beklenmeyen hata: {e}", exc_info=True)
-                return None
-        last_jupiter_call_time = time.time() # Deneme döngüsü bittiğinde zamanı güncelle (başarısız olsa bile)
-return Noneasync def send_and_confirm_transaction(transaction_base64: str, max_retries=5, initial_delay=5.0):
-    """
-    Serileştirilmiş bir işlemi Solana ağına gönderir ve onaylanmasını bekler.
-    """
-    if not solana_client or not payer_keypair:
-        logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. İşlem gönderilemiyor.")
-        return None, "Solana istemcisi başlatılmadı."try:
-    # Base64 string'i baytlara dönüştür
-    raw_transaction = base64.b64decode(transaction_base64)
-    
-    # İşlemi Keypair ile imzala
-    # `VersionedTransaction.from_bytes` kullanarak işlemi yeniden oluştur
-    # Bu kısım solders kütüphanesinin güncel versiyonuyla uyumlu olmalı.
-    # Jupiter'den gelen işlem genellikle zaten kısmen imzalı veya mesaj formatında olabilir.
-    # Burada sadece payer_keypair ile imzalama adımı simüle ediliyor veya tamamlanıyor.
-    
-    # Eğer Jupiter'den gelen işlem doğrudan MessageV0 ise:
-    # message = MessageV0.from_bytes(raw_transaction)
-    # transaction = VersionedTransaction(message, [payer_keypair.sign_message(message.serialize())])
-
-    # Eğer Jupiter'den gelen işlem zaten bir VersionedTransaction ise:
-    # transaction = VersionedTransaction.from_bytes(raw_transaction)
-    # transaction.sign([payer_keypair]) # Bu metot olmayabilir, Solders'ın nasıl çalıştığına bakılmalı.
-    
-    # Basit bir imzalama simülasyonu veya Jupiter'in döndürdüğü formatı kullanarak:
-    # Genellikle Jupiter, kısmen imzalı bir işlem döndürür, bizim sadece kendi cüzdanımızla imzalamamız gerekir.
-    # Burada `raw_transaction`'ın doğrudan gönderilebilecek bir formatta olduğunu varsayıyoruz
-    # ve sadece RPC çağrısını simüle ediyoruz.
-    
-    # Gerçek kullanımda:
-    # transaction = VersionedTransaction.from_bytes(raw_transaction)
-    # transaction.sign([payer_keypair])
-    # signature = await asyncio.to_thread(solana_client.send_transaction, transaction)
-    # logger.info(f"İşlem gönderildi, imza: {signature}")
-    # await asyncio.to_thread(solana_client.confirm_transaction, signature, commitment="confirmed")
-
-    # Simülasyon:
-    signature = Signature.new_unique() # Sahte bir imza oluştur
-    logger.info(f"İşlem gönderiliyor (simülasyon), imza: {signature}")
-    
-    for i in range(max_retries):
-        try:
-            # Gerçekte: await asyncio.to_thread(solana_client.send_raw_transaction, raw_transaction)
-            # Simülasyon:
-            await asyncio.sleep(random.uniform(1.0, 3.0)) # Gönderme süresi
-            
-            # Gerçekte: confirmation = await asyncio.to_thread(solana_client.confirm_transaction, signature, commitment="confirmed")
-            # Simülasyon:
-            if random.random() < 0.1 and i < max_retries - 1: # %10 ihtimalle geçici hata
-                raise RPCException("Simulated temporary RPC error during confirmation")
-            
-            # Başarılı onay simülasyonu
-            logger.info(f"İşlem {signature} onaylandı (simülasyon).")
-            return str(signature), "success"
-        except RPCException as e:
-            logger.warning(f"İşlem gönderme/onaylama denemesi {i+1}/{max_retries} başarısız: {e}")
-            if i < max_retries - 1:
-                await asyncio.sleep(initial_delay * (2 ** i) + random.uniform(0, 1))
-            else:
-                logger.error(f"İşlem gönderme/onaylama için maksimum yeniden deneme sayısına ulaşıldı: {e}")
-                return None, f"İşlem onaylanamadı: {e}"
-        except Exception as e:
-            logger.error(f"İşlem gönderme/onaylama sırasında beklenmeyen hata: {e}", exc_info=True)
-            return None, f"Bilinmeyen hata: {e}"
-
-except Exception as e:
-    logger.error(f"İşlem işlenirken hata: {e}", exc_info=True)
-    return None, f"İşlem işlenirken hata: {e}"async def auto_buy_token(contract_address: str, token_name: str):
-    """
-    Belirtilen sözleşme adresi için otomatik token alımını gerçekleştirir.
-    """
-    if not solana_client or not payer_keypair:
-        logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Otomatik alım yapılamıyor.")
-        await bot_client.send_message(
-            DEFAULT_ADMIN_ID,
-            " **Otomatik Alım Başarısız!**\n"
-            "Solana istemcisi veya cüzdan başlatılmamış. Lütfen özel anahtarınızı ayarlayın ve botu yeniden başlatın.",
-            parse_mode='md'
-        )
-        returnif await is_contract_processed(contract_address):
-    logger.info(f"Sözleşme {contract_address} zaten işlenmiş, atlanıyor.")
-    return
-
-auto_buy_enabled = await get_bot_setting("auto_buy_enabled")
-if auto_buy_enabled != "enabled":
-    logger.info("Otomatik alım devre dışı bırakıldı.")
-    return
-
-buy_amount_sol_str = await get_bot_setting("buy_amount_sol")
-slippage_tolerance_str = await get_bot_setting("slippage_tolerance")
-profit_target_x_str = await get_bot_setting("profit_target_x")
-stop_loss_percent_str = await get_bot_setting("stop_loss_percent")
-
-try:
-    buy_amount_sol = float(buy_amount_sol_str)
-    slippage_bps = int(float(slippage_tolerance_str) * 100) # %'den bps'ye
-    profit_target_x = float(profit_target_x_str)
-    stop_loss_percent = float(stop_loss_percent_str)
-except ValueError:
-    logger.error("Geçersiz bot ayarları (sayısal değerler). Otomatik alım iptal edildi.")
-    await bot_client.send_message(
-        DEFAULT_ADMIN_ID,
-        " **Otomatik Alım Başarısız!**\n"
-        "Bot ayarları (alım miktarı, slippage, kar hedefi, stop loss) geçersiz. Lütfen `/settings` ile kontrol edin.",
-        parse_mode='md'
-    )
-    return
-
-logger.info(f"Yeni token {token_name} ({contract_address}) için otomatik alım başlatılıyor...")
-await bot_client.send_message(
-    DEFAULT_ADMIN_ID,
-    f" **Yeni Token Sinyali Yakalandı!**\n"
-    f"Token: **{token_name}**\n"
-    f"Adres: `{contract_address}`\n"
-    f"Alım işlemi başlatılıyor... ({buy_amount_sol} SOL)",
-    parse_mode='md'
-)
-
-try:
-    # SOL'den token'a takas teklifi al
-    sol_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
-    token_mint = Pubkey.from_string(contract_address)
-    
-    # SOL miktarını lamports'a çevir
-    amount_in_lamports = int(buy_amount_sol * (10**9))
-
-    quote = await get_swap_quote(sol_mint, token_mint, amount_in_lamports, slippage_bps)
-
-    if not quote:
-        raise Exception("Jupiter'den takas teklifi alınamadı.")
-
-    # Takas işlemini al
-    swap_transaction_data = await get_swap_transaction(quote, payer_keypair.pubkey())
-
-    if not swap_transaction_data or "swapTransaction" not in swap_transaction_data:
-        raise Exception("Jupiter'den takas işlemi alınamadı.")
-
-    # İşlemi gönder ve onayla
-    tx_signature, tx_status = await send_and_confirm_transaction(swap_transaction_data["swapTransaction"])
-
-    if tx_status != "success" or not tx_signature:
-        raise Exception(f"İşlem gönderilemedi veya onaylanamadı: {tx_status}")
-
-    # Alınan token miktarını hesapla (yaklaşık olarak)
-    # Jupiter'den gelen outAmount'ı kullanarak daha doğru bir değer elde edebiliriz
-    # outAmount, teklif sırasında alınacak tahmini token miktarıdır.
-    # Bu miktar, token'ın ondalık basamaklarına göre düzeltilmelidir.
-    token_info = await asyncio.to_thread(solana_client.get_token_supply, token_mint)
-    token_decimals = token_info.value.decimals if token_info and token_info.value else 0
-    
-    # outAmount lamports cinsinden, token_decimals'a bölerek gerçek token miktarını bul
-    received_token_amount = float(quote['outAmount']) / (10**token_decimals)
-    
-    # Ortalama alım fiyatını hesapla (SOL/token)
-    # Bu, harcanan SOL miktarı / alınan token miktarı olacaktır.
-    # Eğer quote'da inAmount ve outAmount varsa, bunları kullanmak daha doğru olur.
-    # quote['inAmount'] SOL'ün lamports cinsinden miktarıdır.
-    # quote['outAmount'] token'ın lamports cinsinden miktarıdır.
-    actual_buy_price_sol_per_token = (float(quote['inAmount']) / (10**9)) / (float(quote['outAmount']) / (10**token_decimals))
-    await add_open_position(
-        contract_address,
-        token_name,
-        actual_buy_price_sol_per_token, # Alım fiyatı SOL/token
-        received_token_amount, # Alınan token miktarı
-        tx_signature,
-        profit_target_x,
-        stop_loss_percent
-    )
-    await record_processed_contract(contract_address)
-    await add_transaction_history(
-        tx_signature,
-        "BUY",
-        token_name,
-        contract_address,
-        buy_amount_sol, # Harcanan SOL
-        received_token_amount, # Alınan token
-        actual_buy_price_sol_per_token, # SOL/token fiyatı
-        "SUCCESS"
-    )
-
-    await bot_client.send_message(
-        DEFAULT_ADMIN_ID,
-        f" **Alım Başarılı!**\n"
-        f"Token: **{token_name}**\n"
-        f"Alınan Miktar: `{received_token_amount:.4f} {token_name}`\n"
-        f"Harcanan SOL: `{buy_amount_sol:.4f}`\n"
-        f"Alım Fiyatı: `{actual_buy_price_sol_per_token:.8f} SOL/{token_name}`\n"
-        f"İşlem ID: [`{tx_signature}`](https://solscan.io/tx/{tx_signature})\n"
-        f"Kar Hedefi: `{profit_target_x}x`, Stop Loss: `{stop_loss_percent}%`",
-        parse_mode='md',
-        link_preview=False
-    )
-    logger.info(f"Otomatik alım {token_name} için tamamlandı. İmza: {tx_signature}")
-
-except Exception as e:
-    error_msg = f"Otomatik alım {token_name} ({contract_address}) için başarısız oldu: {e}"
-    logger.error(error_msg, exc_info=True)
-    await add_transaction_history(
-        "N/A", # Başarısız işlemler için imza olmayabilir
-        "BUY",
-        token_name,
-        contract_address,
-        buy_amount_sol,
-        0,
-        0,
-        "FAILED",
-        str(e)
-    )
-    await bot_client.send_message(
-        DEFAULT_ADMIN_ID,
-        f" **Otomatik Alım Başarısız!**\n"
-        f"Token: **{token_name}**\n"
-        f"Adres: `{contract_address}`\n"
-        f"Hata: `{e}`",
-        parse_mode='md'
-    )async def auto_sell_token(contract_address: str, token_name: str, sell_reason: str, position_data: dict):
-    """
-    Belirtilen sözleşme adresi için otomatik token satışını gerçekleştirir.
-    """
-    if not solana_client or not payer_keypair:
-        logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Otomatik satış yapılamıyor.")
-        await bot_client.send_message(
-            DEFAULT_ADMIN_ID,
-            " **Otomatik Satış Başarısız!**\n"
-            "Solana istemcisi veya cüzdan başlatılmamış. Lütfen özel anahtarınızı ayarlayın ve botu yeniden başlatın.",
-            parse_mode='md'
-        )
-        returnauto_sell_enabled = await get_bot_setting("auto_sell_enabled")
-if auto_sell_enabled != "enabled":
-    logger.info("Otomatik satış devre dışı bırakıldı.")
-    return
-
-logger.info(f"Token {token_name} ({contract_address}) için otomatik satış başlatılıyor... Neden: {sell_reason}")
-await bot_client.send_message(
-    DEFAULT_ADMIN_ID,
-    f" **Otomatik Satış Tetiklendi!**\n"
-    f"Token: **{token_name}**\n"
-    f"Adres: `{contract_address}`\n"
-    f"Neden: **{sell_reason}**\n"
-    f"Satış işlemi başlatılıyor...",
-    parse_mode='md'
-)
-
-try:
-    # Token'dan SOL'a takas teklifi al
-    token_mint = Pubkey.from_string(contract_address)
-    sol_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
-    
-    # Satılacak token miktarını al (açık pozisyondan)
-    amount_to_sell_token = position_data['buy_amount_token']
-
-    # Token'ın ondalık basamaklarını al
-    token_info = await asyncio.to_thread(solana_client.get_token_supply, token_mint)
-    token_decimals = token_info.value.decimals if token_info and token_info.value else 0
-    amount_in_lamports = int(amount_to_sell_token * (10**token_decimals))
-
-    slippage_tolerance_str = await get_bot_setting("slippage_tolerance")
-    slippage_bps = int(float(slippage_tolerance_str) * 100)
-
-    quote = await get_swap_quote(token_mint, sol_mint, amount_in_lamports, slippage_bps)
-
-    if not quote:
-        raise Exception("Jupiter'den takas teklifi alınamadı.")
-
-    # Takas işlemini al
-    swap_transaction_data = await get_swap_transaction(quote, payer_keypair.pubkey())
-
-    if not swap_transaction_data or "swapTransaction" not in swap_transaction_data:
-        raise Exception("Jupiter'den takas işlemi alınamadı.")
-
-    # İşlemi gönder ve onayla
-    tx_signature, tx_status = await send_and_confirm_transaction(swap_transaction_data["swapTransaction"])
-
-    if tx_status != "success" or not tx_signature:
-        raise Exception(f"İşlem gönderilemedi veya onaylanamadı: {tx_status}")
-
-    # Alınan SOL miktarını hesapla (yaklaşık olarak)
-    received_sol_amount = float(quote['outAmount']) / (10**9)
-    
-    # Ortalama satış fiyatını hesapla (SOL/token)
-    actual_sell_price_sol_per_token = (float(quote['outAmount']) / (10**9)) / (float(quote['inAmount']) / (10**token_decimals))
-
-    # Pozisyonu veritabanından kaldır
-    await remove_open_position(contract_address)
-    await add_transaction_history(
-        tx_signature,
-        "SELL",
-        token_name,
-        contract_address,
-        received_sol_amount, # Alınan SOL
-        amount_to_sell_token, # Satılan token
-        actual_sell_price_sol_per_token, # SOL/token fiyatı
-        "SUCCESS"
-    )
-
-    profit_loss_sol = received_sol_amount - (position_data['buy_amount_token'] * position_data['buy_price_sol'])
-    profit_loss_percent = (profit_loss_sol / (position_data['buy_amount_token'] * position_data['buy_price_sol'])) * 100
-
-    await bot_client.send_message(
-        DEFAULT_ADMIN_ID,
-        f" **Satış Başarılı!**\n"
-        f"Token: **{token_name}**\n"
-        f"Satılan Miktar: `{amount_to_sell_token:.4f} {token_name}`\n"
-        f"Alınan SOL: `{received_sol_amount:.4f}`\n"
-        f"Satış Fiyatı: `{actual_sell_price_sol_per_token:.8f} SOL/{token_name}`\n"
-        f"Kar/Zarar: `{profit_loss_sol:.4f} SOL ({profit_loss_percent:.2f}%)`\n"
-        f"İşlem ID: [`{tx_signature}`](https://solscan.io/tx/{tx_signature})",
-        parse_mode='md',
-        link_preview=False
-    )
-    logger.info(f"Otomatik satış {token_name} için tamamlandı. İmza: {tx_signature}")
-
-except Exception as e:
-    error_msg = f"Otomatik satış {token_name} ({contract_address}) için başarısız oldu: {e}"
-    logger.error(error_msg, exc_info=True)
-    await add_transaction_history(
-        "N/A",
-        "SELL",
-        token_name,
-        contract_address,
-        0,
-        amount_to_sell_token,
-        0,
-        "FAILED",
-        str(e)
-    )
-    await bot_client.send_message(
-        DEFAULT_ADMIN_ID,
-        f" **Otomatik Satış Başarısız!**\n"
-        f"Token: **{token_name}**\n"
-        f"Adres: `{contract_address}`\n"
-        f"Hata: `{e}`",
-        parse_mode='md'
-    )# --- Telegram Bot Komutları ---
-@bot_client.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnawait event.reply(
-    " **Solana Memetoken Otomatik Alım-Satım Botuna Hoş Geldiniz!**\n\n"
-    "Aşağıdaki komutları kullanabilirsiniz:\n"
-    "• `/status` - Botun mevcut durumunu gösterir.\n"
-    "• `/settings` - Bot ayarlarını görüntüle/değiştir.\n"
-    "• `/positions` - Açık pozisyonlarınızı görüntüleyin.\n"
-    "• `/history` - Son işlem geçmişinizi görüntüleyin.\n"
-    "• `/buy <token_address> <sol_amount>` - Belirli bir token'ı manuel olarak satın alın.\n"
-    "• `/sell <token_address>` - Belirli bir token'ı manuel olarak satın.\n"
-    "• `/reinit_solana` - Solana istemcisini ve cüzdanı yeniden başlatır.\n"
-    "• `/admin` - Yönetici ekle/kaldır (yalnızca varsayılan yönetici).\n\n"
-    "Botunuzu yapılandırmak için `/settings` komutunu kullanmayı unutmayın.",
-    parse_mode='md'
-)@bot_client.on(events.NewMessage(pattern='/admin'))
-async def admin_handler(event):
-    if event.sender_id != DEFAULT_ADMIN_ID:
-        await event.reply("Bu komutu kullanma yetkiniz yok. Yalnızca varsayılan yönetici kullanabilir.")
-        returnargs = event.text.split()
-if len(args) < 2:
-    admins = await get_admins()
-    admin_list = "\n".join([f"- {a['first_name']} ({a['user_id']})" for a in admins.values()])
-    await event.reply(
-        "**Yönetici Yönetimi**\n\n"
-        f"Mevcut Yöneticiler:\n{admin_list}\n\n"
-        "Kullanım:\n"
-        "`/admin add <user_id>`\n"
-        "`/admin remove <user_id>`",
-        parse_mode='md'
-    )
-    return
-
-action = args[1].lower()
-if action == "add" and len(args) == 3:
     try:
-        user_id = int(args[2])
-        # Kullanıcının adını almak için bir deneme yap
-        try:
-            user = await bot_client.get_entity(user_id)
-            first_name = user.first_name if user.first_name else "Bilinmeyen"
-            last_name = user.last_name if user.last_name else ""
-        except Exception:
-            first_name = "Bilinmeyen"
-            last_name = ""
+        quote_url = f"{JUPITER_API_URL}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in_lamports}&slippageBps={slippage_bps}"
+        response = requests.get(quote_url)
+        response.raise_for_status()
+        quote_data = response.json()
         
-        await add_admin(user_id, first_name, last_name)
-        await event.reply(f"Yönetici {user_id} ({first_name}) başarıyla eklendi.")
-    except ValueError:
-        await event.reply("Geçersiz kullanıcı ID'si.")
-elif action == "remove" and len(args) == 3:
+        if not quote_data or "swapMode" not in quote_data:
+            logger.error(f"Geçersiz teklif verisi alındı: {quote_data}")
+            return None
+
+        logger.info(f"Jupiter teklifi {input_mint}'ten {output_mint}'e alındı: {quote_data.get('outAmount')} {quote_data.get('outputToken', {}).get('symbol')}")
+        return quote_data
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Jupiter teklifi alınırken hata: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"get_swap_quote içinde beklenmeyen hata: {e}")
+        return None
+
+async def perform_swap(quote_data: dict):
+    """Jupiter Aggregator'dan alınan teklifle bir takas işlemi gerçekleştirir."""
+    if not solana_client or not payer_keypair:
+        logger.error("Solana istemcisi veya ödeme anahtarı başlatılmadı. Takas yapılamıyor.")
+        return False, "Solana istemcisi veya cüzdan hazır değil.", None
+
     try:
-        user_id = int(args[2])
-        if user_id == DEFAULT_ADMIN_ID:
-            await event.reply("Varsayılan yönetici kaldırılamaz.")
-            return
-        await remove_admin(user_id)
-        await event.reply(f"Yönetici {user_id} başarıyla kaldırıldı.")
-    except ValueError:
-        await event.reply("Geçersiz kullanıcı ID'si.")
-else:
-    await event.reply("Geçersiz komut. Kullanım:\n`/admin add <user_id>`\n`/admin remove <user_id>`")@bot_client.on(events.NewMessage(pattern='/settings'))
-async def settings_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnargs = event.text.split(maxsplit=2) # Sadece 2 parçaya ayır: /settings, key, value
+        swap_url = f"{JUPITER_API_URL}/swap"
+        swap_response = requests.post(swap_url, json={
+            "quoteResponse": quote_data,
+            "userPublicKey": str(payer_keypair.pubkey()),
+            "wrapUnwrapSOL": True,
+            "prioritizationFeeLamports": 100000
+        })
+        swap_response.raise_for_status() # Kötü yanıtlar için HTTPError yükseltir (örn. 4xx, 5xx)
+        swap_data = swap_response.json()
 
-if len(args) == 1: # Ayarları göster
-    settings = {}
-    for key in DEFAULT_BOT_SETTINGS.keys():
-        value = await get_bot_setting(key)
-        if key == "SOLANA_PRIVATE_KEY" and value:
-            settings[key] = value[:5] + "..." + value[-5:] # Maskele
-        elif key == "JUPITER_API_KEY" and value:
-            settings[key] = value[:5] + "..." + value[-5:] # Maskele
+        if not swap_data or "swapTransaction" not in swap_data:
+            logger.error(f"Jupiter'den geçersiz takas verisi alındı: {swap_data}")
+            return False, "Geçersiz takas işlem verisi.", None
+
+        # KRİTİK DÜZELTME: swapTransaction'ın çözmeden önce bir dize olduğundan emin olun
+        swap_transaction_str = swap_data.get("swapTransaction")
+        if not isinstance(swap_transaction_str, str):
+            error_msg = f"Jupiter API 'swapTransaction'ı dize olarak döndürmedi. Tür: {type(swap_transaction_str)}, Değer: {swap_transaction_str}"
+            logger.error(error_msg)
+            return False, error_msg, None
+
+        # Base64 işlemi çöz
+        tx_bytes = base64.b64decode(swap_transaction_str)
+        
+        # Yeni yöntem: Ham işlemi doğrudan gönder (skip_preflight=False olarak ayarlandı)
+        tx_signature = await asyncio.to_thread(
+            solana_client.send_raw_transaction,
+            tx_bytes,
+            opts=TxOpts(skip_preflight=False) # skip_preflight=False olarak değiştirildi
+        )
+        
+        logger.info(f"Takas işlemi gönderildi: {tx_signature}")
+
+        # Onay bekle
+        confirmation = await asyncio.to_thread(
+            solana_client.confirm_transaction,
+            tx_signature,
+            commitment="confirmed"
+        )
+        
+        # Onayı kontrol et
+        if confirmation.value and confirmation.value[0].err:
+            logger.error(f"İşlem hatayla başarısız oldu: {confirmation.value[0].err}")
+            return False, f"İşlem başarısız oldu: {confirmation.value[0].err}", None
         else:
-            settings[key] = value if value is not None else "AYARLANMADI"
+            logger.info(f"İşlem onaylandı: {tx_signature}")
+            return True, tx_signature, quote_data
 
-    settings_msg = "**Bot Ayarları:**\n\n"
-    for key, value in settings.items():
-        settings_msg += f"• `{key}`: `{value}`\n"
-    settings_msg += "\nAyarları değiştirmek için:\n`/settings <anahtar> <değer>`"
-    await event.reply(settings_msg, parse_mode='md')
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Jupiter ile takas yapılırken hata: {e}")
+        return False, f"HTTP istek hatası: {e}", None
+    except RPCException as e:
+        logger.error(f"Takas sırasında Solana RPC hatası: {e}")
+        return False, f"Solana RPC hatası: {e}", None
+    except Exception as e:
+        logger.error(f"perform_swap içinde beklenmeyen hata: {str(e)}", exc_info=True)
+        return False, f"Beklenmeyen hata: {str(e)}", None
 
-elif len(args) == 3: # Ayarı değiştir
-    setting_key = args[1].strip()
-    setting_value = args[2].strip()
+async def auto_buy_token(contract_address: str, token_name: str, buy_amount_sol: float, slippage_tolerance_percent: float):
+    """Belirtilen sözleşme adresindeki token'ı otomatik olarak satın alır."""
+    if not solana_client or not payer_keypair:
+        logger.error("Otomatik alım atlandı: Solana istemcisi veya cüzdan başlatılmadı.")
+        return False, "Cüzdan hazır değil.", None, None
 
-    if setting_key not in DEFAULT_BOT_SETTINGS:
-        await event.reply(f"Bilinmeyen ayar anahtarı: `{setting_key}`")
-        return
-
-    if setting_key == "SOLANA_PRIVATE_KEY" and not re.match(r"^[1-9A-HJ-NP-Za-km-z]{87,88}$", setting_value):
-        await event.reply("Geçersiz Solana özel anahtarı formatı. Base58 string olmalı.")
-        return
-    
-    # Sayısal değerler için doğrulama
-    if setting_key in ["buy_amount_sol", "slippage_tolerance", "profit_target_x", "stop_loss_percent"]:
-        try:
-            float(setting_value)
-        except ValueError:
-            await event.reply(f"`{setting_key}` için geçerli bir sayısal değer girin.")
-            return
-
-    await set_bot_setting(setting_key, setting_value)
-    if setting_key == "SOLANA_PRIVATE_KEY" or setting_key == "JUPITER_API_KEY":
-        await event.reply(f"Ayar `{setting_key}` başarıyla güncellendi (güvenlik için maskelendi).")
-        # Özel anahtar değiştiyse Solana istemcisini yeniden başlat
-        if setting_key == "SOLANA_PRIVATE_KEY":
-            await init_solana_client()
-            await event.reply("Solana istemcisi özel anahtar değişikliği nedeniyle yeniden başlatıldı.")
-    else:
-        await event.reply(f"Ayar `{setting_key}` başarıyla `{setting_value}` olarak güncellendi.")
-else:
-    await event.reply("Geçersiz kullanım. Kullanım:\n`/settings` (göster)\n`/settings <anahtar> <değer>` (değiştir)")@bot_client.on(events.NewMessage(pattern='/status'))
-async def status_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnbot_status = await get_bot_setting("bot_status")
-auto_buy_enabled = await get_bot_setting("auto_buy_enabled")
-auto_sell_enabled = await get_bot_setting("auto_sell_enabled")
-
-balance = await check_wallet_balance()
-wallet_address = payer_keypair.pubkey() if payer_keypair else "Ayarlanmadı"
-
-status_msg = "**Bot Durumu:**\n\n"
-status_msg += f"• Bot Durumu: `{bot_status.upper()}`\n"
-status_msg += f"• Otomatik Alım: `{auto_buy_enabled.upper()}`\n"
-status_msg += f"• Otomatik Satış: `{auto_sell_enabled.upper()}`\n"
-status_msg += f"• Cüzdan Adresi: `{wallet_address}`\n"
-status_msg += f"• SOL Bakiyesi: `{balance:.4f} SOL`" if balance is not None else "• SOL Bakiyesi: `Alınamadı`\n"
-status_msg += f"• Aktif RPC: `{active_rpc_url if active_rpc_url else 'Bilinmiyor'}`\n"
-
-await event.reply(status_msg, parse_mode='md')@bot_client.on(events.NewMessage(pattern='/positions'))
-async def positions_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnpositions = await get_open_positions()
-if not positions:
-    await event.reply("Açık pozisyon bulunmamaktadır.")
-    return
-
-positions_msg = "**Açık Pozisyonlar:**\n\n"
-for pos in positions:
-    buy_time = datetime.fromtimestamp(pos['buy_timestamp']).strftime('%Y-%m-%d %H:%M:%S')
-    positions_msg += (
-        f"• Token: **{pos['token_name']}** (`{pos['contract_address'][:6]}...{pos['contract_address'][-4:]}`)\n"
-        f"  Alım Fiyatı: `{pos['buy_price_sol']:.8f} SOL/token`\n"
-        f"  Alınan Miktar: `{pos['buy_amount_token']:.4f} token`\n"
-        f"  Alım TX: [`{pos['buy_tx_signature'][:6]}...{pos['buy_tx_signature'][-4:]}`](https://solscan.io/tx/{pos['buy_tx_signature']})\n"
-        f"  Kar Hedefi: `{pos['target_profit_x']}x`, Stop Loss: `{pos['stop_loss_percent']}%`\n"
-        f"  Alım Zamanı: `{buy_time}`\n\n"
-    )
-await event.reply(positions_msg, parse_mode='md', link_preview=False)@bot_client.on(events.NewMessage(pattern='/history'))
-async def history_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnhistory = await get_transaction_history()
-if not history:
-    await event.reply("İşlem geçmişi bulunmamaktadır.")
-    return
-
-history_msg = "**Son İşlem Geçmişi (Son 20 İşlem):**\n\n"
-for tx in history:
-    tx_time = datetime.fromtimestamp(tx['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
-    history_msg += (
-        f"• Tür: **{tx['type']}** | Durum: **{tx['status']}**\n"
-        f"  Token: **{tx['token_name']}** (`{tx['contract_address'][:6]}...{tx['contract_address'][-4:]}`)\n"
-        f"  SOL Miktarı: `{tx['amount_sol']:.4f}` | Token Miktarı: `{tx['amount_token']:.4f}`\n"
-        f"  Fiyat: `{tx['price_sol_per_token']:.8f} SOL/token`\n"
-        f"  TX ID: [`{tx['tx_signature'][:6]}...{tx['tx_signature'][-4:]}`](https://solscan.io/tx/{tx['tx_signature']})\n"
-        f"  Zaman: `{tx_time}`\n"
-    )
-    if tx['error_message']:
-        history_msg += f"  Hata: `{tx['error_message']}`\n"
-    history_msg += "\n"
-await event.reply(history_msg, parse_mode='md', link_preview=False)@bot_client.on(events.NewMessage(pattern='/buy'))
-async def manual_buy_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnargs = event.text.split()
-if len(args) != 3:
-    await event.reply("Kullanım: `/buy <token_address> <sol_amount>`")
-    return
-
-token_address = args[1]
-sol_amount_str = args[2]
-
-try:
-    sol_amount = float(sol_amount_str)
-    if sol_amount <= 0:
-        raise ValueError("SOL miktarı pozitif olmalı.")
-except ValueError:
-    await event.reply("Geçersiz SOL miktarı.")
-    return
-
-if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", token_address):
-    await event.reply("Geçersiz token adresi formatı.")
-    return
-
-# Manuel alım için token adını "manuel_alım" olarak varsayalım veya bir yerden alalım
-token_name = "Manuel Token" # Gerçek bir isim almak için başka bir API çağrısı gerekebilir
-
-await event.reply(f"Manuel alım başlatılıyor: {sol_amount} SOL karşılığında {token_address} tokenı...")
-await auto_buy_token(token_address, token_name)
-await event.reply("Manuel alım işlemi tamamlandı (yukarıdaki mesajları kontrol edin).")@bot_client.on(events.NewMessage(pattern='/sell'))
-async def manual_sell_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnargs = event.text.split()
-if len(args) != 2:
-    await event.reply("Kullanım: `/sell <token_address>`")
-    return
-
-token_address = args[1]
-
-if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", token_address):
-    await event.reply("Geçersiz token adresi formatı.")
-    return
-
-positions = await get_open_positions()
-position_to_sell = next((p for p in positions if p['contract_address'] == token_address), None)
-
-if not position_to_sell:
-    await event.reply(f"Açık pozisyonlarda {token_address} tokenı bulunamadı.")
-    return
-
-# Manuel satış için token adını pozisyondan alalım
-token_name = position_to_sell['token_name']
-
-await event.reply(f"Manuel satış başlatılıyor: {token_name} ({token_address})...")
-await auto_sell_token(token_address, token_name, "Manuel Satış", position_to_sell)
-await event.reply("Manuel satış işlemi tamamlandı (yukarıdaki mesajları kontrol edin).")@bot_client.on(events.NewMessage(pattern='/reinit_solana'))
-async def reinit_solana_handler(event):
-    admins = await get_admins()
-    if event.sender_id not in admins:
-        await event.reply("Üzgünüm, bu botu kullanma yetkiniz yok.")
-        returnawait event.reply("Solana istemcisi ve cüzdan yeniden başlatılıyor...")
-await init_solana_client()
-if solana_client and payer_keypair:
-    balance = await check_wallet_balance()
-    await event.reply(
-        f" Solana istemcisi başarıyla yeniden başlatıldı.\n"
-        f"Cüzdan: `{payer_keypair.pubkey()}`\n"
-        f"Bakiye: `{balance:.4f} SOL`" if balance is not None else "Bakiye: `Alınamadı`",
-        parse_mode='md'
-    )
-else:
-    await event.reply(" Solana istemcisinin yeniden başlatılması başarısız oldu. Logları kontrol edin.")# --- Telegram Kanalı Dinleyicisi ---
-@bot_client.on(events.NewMessage(chats=SOURCE_CHANNEL_ID))
-async def channel_message_handler(event):
-    logger.info(f"Kanal {SOURCE_CHANNEL_ID} adresinden yeni mesaj alındı.")
-    logger.debug(f"Mesaj içeriği: {event.text}")contract_address = extract_contract(event.text)
-token_name = extract_token_name_from_message(event.text)
-
-if contract_address:
-    logger.info(f"Mesajdan sözleşme adresi çıkarıldı: {contract_address}")
     if await is_contract_processed(contract_address):
-        logger.info(f"Sözleşme {contract_address} zaten işlenmiş.")
-        return
+        logger.info(f"Sözleşme {contract_address} otomatik alım için zaten işlendi. Atlanıyor.")
+        return False, "Sözleşme zaten işlendi.", None, None
 
-    bot_status = await get_bot_setting("bot_status")
-    if bot_status == "running":
-        # Otomatik alım işlemini arka planda başlat
-        asyncio.create_task(auto_buy_token(contract_address, token_name))
+    # Cüzdan bakiyesini kontrol et
+    current_balance = await check_wallet_balance()
+    if current_balance is None:
+        await add_transaction_history(
+            "N/A", 'buy', token_name, contract_address,
+            buy_amount_sol, 0.0, 0.0, 'failed', "Cüzdan bakiyesi alınamadı."
+        )
+        return False, "Cüzdan bakiyesi alınamadı", None, None
+        
+    if current_balance < buy_amount_sol:
+        error_msg = f"Yetersiz SOL bakiyesi. Gerekli: {buy_amount_sol} SOL, Mevcut: {current_balance:.4f} SOL."
+        logger.error(error_msg)
+        await add_transaction_history(
+            "N/A", 'buy', token_name, contract_address,
+            buy_amount_sol, 0.0, 0.0, 'failed', error_msg
+        )
+        return False, error_msg, None, None
+
+    input_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
+    output_mint = Pubkey.from_string(contract_address)
+    amount_in_lamports = int(buy_amount_sol * 10**9)
+    slippage_bps = int(slippage_tolerance_percent * 100)
+
+    logger.info(f"{contract_address} ({token_name}) için {buy_amount_sol} SOL ve {slippage_tolerance_percent}% slippage ile otomatik alım deneniyor.")
+
+    quote_data = await get_swap_quote(input_mint, output_mint, amount_in_lamports, slippage_bps)
+    if not quote_data:
+        await add_transaction_history(
+            "N/A", 'buy', token_name, contract_address,
+            buy_amount_sol, 0.0, 0.0, 'failed', "Takas teklifi alınamadı."
+        )
+        logger.error(f"{contract_address} için takas teklifi alınamadı.")
+        return False, "Takas teklifi alınamadı.", None, None
+
+    # perform_swap için yeniden deneme mekanizması
+    max_swap_retries = 3
+    swap_success = False
+    tx_signature = None
+    final_quote_data = None
+    swap_error_message = ""
+
+    for attempt in range(max_swap_retries):
+        logger.info(f"{token_name} için takas deneniyor (Deneme {attempt+1}/{max_swap_retries})")
+        success, msg, data = await perform_swap(quote_data)
+        if success:
+            swap_success = True
+            tx_signature = msg
+            final_quote_data = data
+            swap_error_message = "" # Önceki hata mesajını temizle
+            break
+        else:
+            swap_error_message = msg # Bu hata mesajı olacak
+            logger.warning(f"{token_name} için takas denemesi {attempt+1}/{max_swap_retries} başarısız oldu: {msg}")
+            if attempt < max_swap_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1)) # Üstel geri çekilme
+    
+    if not swap_success:
+        await add_transaction_history(
+            "N/A", 'buy', token_name, contract_address,
+            buy_amount_sol, 0.0, 0.0, 'failed', swap_error_message
+        )
+        logger.error(f"{max_swap_retries} denemeden sonra {contract_address} token'ı otomatik alım başarısız oldu: {swap_error_message}")
+        return False, f"Token {token_name} satın alınamadı: {swap_error_message}", None, None
+    
+    # Takas başarılı olursa
+    await record_processed_contract(contract_address)
+
+    output_token_decimals = final_quote_data.get('outputToken', {}).get('decimals')
+    if output_token_decimals is None:
+        logger.warning(f"{token_name} için ondalık basamaklar belirlenemedi. Satın alınan miktar hesaplanamıyor.")
+        bought_amount_token = 0.0
+        actual_buy_price_sol = 0.0
     else:
-        logger.info("Bot duraklatıldı, otomatik alım tetiklenmedi.")
-else:
-    logger.debug("Mesajda sözleşme adresi bulunamadı.")# --- Açık Pozisyonları İzleme Görevi ---
-async def monitor_open_positions():
-    """
-    Açık pozisyonları periyodik olarak kontrol eder ve kar/zarar hedeflerine göre satış yapar.
-    """
-    await bot_client.send_message(DEFAULT_ADMIN_ID, " **Pozisyon İzleyici Başlatıldı.**")
+        bought_amount_token_lamports = int(final_quote_data['outAmount'])
+        bought_amount_token = bought_amount_token_lamports / (10**output_token_decimals)
+        actual_buy_price_sol = buy_amount_sol / bought_amount_token if bought_amount_token > 0 else 0.0
+
+    await add_transaction_history(
+        tx_signature, 'buy', token_name, contract_address,
+        buy_amount_sol, bought_amount_token, actual_buy_price_sol, 'success'
+    )
+    logger.info(f"Token {contract_address} başarıyla otomatik olarak satın alındı. İşlem: {tx_signature}")
+    return True, f"Token {token_name} başarıyla satın alındı. İşlem: {tx_signature}", actual_buy_price_sol, bought_amount_token
+
+async def auto_sell_token(contract_address: str, token_name: str, amount_to_sell_token: float, slippage_tolerance_percent: float):
+    """Belirtilen token'ı otomatik olarak satar."""
+    if not solana_client or not payer_keypair:
+        logger.error("Otomatik satış atlandı: Solana istemcisi veya cüzdan başlatılmadı.")
+        return False, "Cüzdan hazır değil."
+
+    input_mint = Pubkey.from_string(contract_address)
+    output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
+    slippage_bps = int(slippage_tolerance_percent * 100)
+
+    token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint)
+    if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
+        await add_transaction_history(
+            "N/A", 'sell', token_name, contract_address,
+            0.0, amount_to_sell_token, 0.0, 'failed', "Satış için token ondalık basamakları alınamadı."
+        )
+        logger.warning(f"{token_name} için token arz bilgisi alınamadı. Satış için ondalık basamaklar belirlenemiyor.")
+        return False, "Token ondalık basamakları alınamadı."
+    decimals = token_info.value.decimals
+    
+    amount_in_lamports = int(amount_to_sell_token * (10**decimals))
+
+    logger.info(f"{amount_to_sell_token} {token_name} ({contract_address}) için {slippage_tolerance_percent}% slippage ile otomatik satış deneniyor.")
+
+    quote_data = await get_swap_quote(input_mint, output_mint, amount_in_lamports, slippage_bps)
+    if not quote_data:
+        await add_transaction_history(
+            "N/A", 'sell', token_name, contract_address,
+            0.0, amount_to_sell_token, 0.0, 'failed', "Satış için takas teklifi alınamadı."
+        )
+        logger.error(f"{token_name} satışı için takas teklifi alınamadı.")
+        return False, "Satış için takas teklifi alınamadı."
+
+    # Satış sırasında perform_swap için yeniden deneme mekanizması
+    max_swap_retries = 3
+    swap_success = False
+    tx_signature = None
+    final_quote_data = None
+    swap_error_message = ""
+
+    for attempt in range(max_swap_retries):
+        logger.info(f"{token_name} için satış takası deneniyor (Deneme {attempt+1}/{max_swap_retries})")
+        success, msg, data = await perform_swap(quote_data)
+        if success:
+            swap_success = True
+            tx_signature = msg
+            final_quote_data = data
+            swap_error_message = ""
+            break
+        else:
+            swap_error_message = msg
+            logger.warning(f"{token_name} için satış takas denemesi {attempt+1}/{max_swap_retries} başarısız oldu: {msg}")
+            if attempt < max_swap_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1)) # Üstel geri çekilme
+    
+    if not swap_success:
+        await add_transaction_history(
+            "N/A", 'sell', token_name, contract_address,
+            0.0, amount_to_sell_token, 0.0, 'failed', swap_error_message
+        )
+        logger.error(f"{max_swap_retries} denemeden sonra {token_name} token'ı otomatik satış başarısız oldu: {swap_error_message}")
+        return False, f"Token {token_name} satılamadı: {swap_error_message}"
+
+    # Satış takası başarılı olursa
+    received_sol_lamports = int(final_quote_data['outAmount'])
+    received_sol = received_sol_lamports / (10**9)
+    sell_price_sol_per_token = received_sol / amount_to_sell_token if amount_to_sell_token > 0 else 0.0
+
+    await add_transaction_history(
+        tx_signature, 'sell', token_name, contract_address,
+        received_sol, amount_to_sell_token, sell_price_sol_per_token, 'success'
+    )
+    logger.info(f"Token {token_name} başarıyla otomatik olarak satıldı. İşlem: {tx_signature}")
+    return True, f"Token {token_name} başarıyla satıldı. İşlem: {tx_signature}"
+
+async def monitor_positions_task():
+    """Açık pozisyonları izler ve kar/zarar hedeflerine göre otomatik satış yapar."""
     while True:
-        try:
-            auto_sell_enabled = await get_bot_setting("auto_sell_enabled")
-            if auto_sell_enabled != "enabled":
-                logger.info("Otomatik satış devre dışı, pozisyon izleme duraklatıldı.")
-                await asyncio.sleep(60) # Daha uzun bekle
-                continue        positions = await get_open_positions()
+        await asyncio.sleep(30)
+
+        auto_sell_enabled = await get_bot_setting("auto_sell_enabled")
+        if auto_sell_enabled != "enabled":
+            logger.debug("Otomatik satış devre dışı. Pozisyon izleme atlanıyor.")
+            continue
+
+        positions = await get_open_positions()
         if not positions:
             logger.debug("İzlenecek açık pozisyon yok.")
-            await asyncio.sleep(30) # Daha sık kontrol etmeye gerek yok
             continue
+
+        slippage_tolerance_str = await get_bot_setting("slippage_tolerance")
+        try:
+            slippage_tolerance_percent = float(slippage_tolerance_str)
+        except ValueError:
+            logger.error("Otomatik satış için geçersiz slippage toleransı ayarı. Varsayılan %5 kullanılıyor.")
+            slippage_tolerance_percent = 5.0
 
         for pos in positions:
             contract_address = pos['contract_address']
             token_name = pos['token_name']
             buy_price_sol = pos['buy_price_sol']
+            buy_amount_token = pos['buy_amount_token']
             target_profit_x = pos['target_profit_x']
             stop_loss_percent = pos['stop_loss_percent']
 
-            current_price_sol_per_token = await get_current_token_price_sol(contract_address)
-
-            if current_price_sol_per_token is None:
-                logger.warning(f"{token_name} ({contract_address}) için mevcut fiyat alınamadı. Atlanıyor.")
+            current_price_sol = await get_current_token_price_sol(contract_address)
+            if current_price_sol is None:
+                logger.warning(f"{token_name} için mevcut fiyat alınamadı. Bu pozisyon için izleme atlanıyor.")
                 continue
 
-            # Kar/Zarar hesaplaması
-            current_value_sol = pos['buy_amount_token'] * current_price_sol_per_token
-            initial_cost_sol = pos['buy_amount_token'] * buy_price_sol
-            
-            profit_loss_sol = current_value_sol - initial_cost_sol
-            profit_loss_percent = (profit_loss_sol / initial_cost_sol) * 100 if initial_cost_sol != 0 else 0
+            profit_threshold_price = buy_price_sol * target_profit_x
+            stop_loss_threshold_price = buy_price_sol * (1 - (stop_loss_percent / 100))
 
-            logger.info(f"Pozisyon {token_name}: Mevcut Fiyat: {current_price_sol_per_token:.8f} SOL/token, Kar/Zarar: {profit_loss_percent:.2f}%")
+            logger.info(f"{token_name} ({contract_address}) izleniyor: Alış Fiyatı: {buy_price_sol:.8f} SOL/token, Mevcut Fiyat: {current_price_sol:.8f} SOL/token")
+            logger.info(f"  Hedef Kar Fiyatı: {profit_threshold_price:.8f} SOL/token (x{target_profit_x}), Stop Loss Fiyatı: {stop_loss_threshold_price:.8f} SOL/token ({-stop_loss_percent}%)")
 
-            # Kar Hedefi Kontrolü
-            if current_price_sol_per_token >= (buy_price_sol * target_profit_x):
-                logger.info(f"Kar hedefi {target_profit_x}x ulaşıldı! {token_name} satılıyor.")
-                asyncio.create_task(auto_sell_token(contract_address, token_name, "Kar Hedefi Ulaşıldı", pos))
-            # Stop Loss Kontrolü (negatif yüzde olarak)
-            elif profit_loss_percent <= -abs(stop_loss_percent):
-                logger.info(f"Stop loss {stop_loss_percent}% tetiklendi! {token_name} satılıyor.")
-                asyncio.create_task(auto_sell_token(contract_address, token_name, "Stop Loss Tetiklendi", pos))
-        
-        await asyncio.sleep(30) # Her 30 saniyede bir kontrol et
-    except Exception as e:
-        logger.error(f"Pozisyon izleme sırasında hata: {e}", exc_info=True)
-        await bot_client.send_message(
-            DEFAULT_ADMIN_ID,
-            f" **Pozisyon İzleyici Hatası!**\n"
-            f"Hata: `{e}`\n"
-            "İzleyici devam edecek.",
-            parse_mode='md'
-        )
-        await asyncio.sleep(60) # Hata durumunda daha uzun bekle# --- Flask Web Arayüzü ---
+            should_sell = False
+            sell_reason = ""
+
+            if current_price_sol >= profit_threshold_price:
+                should_sell = True
+                sell_reason = f"{token_name} için kar hedefi ({target_profit_x}x) ulaşıldı."
+            elif current_price_sol <= stop_loss_threshold_price:
+                should_sell = True
+                sell_reason = f"{token_name} için stop-loss ({stop_loss_percent}%) tetiklendi."
+
+            if should_sell:
+                logger.info(f"{token_name} için otomatik satış başlatılıyor: {sell_reason}")
+                success, message = await auto_sell_token(contract_address, token_name, buy_amount_token, slippage_tolerance_percent)
+                if success:
+                    await remove_open_position(contract_address)
+                    await bot_client.send_message(
+                        DEFAULT_ADMIN_ID,
+                        f"✅ Otomatik satım başarılı!\nToken: `{token_name}`\nSebep: `{sell_reason}`\nİşlem: `{message}`",
+                        parse_mode='md'
+                    )
+                    logger.info(f"{token_name} için otomatik satış başarılı. Pozisyon kaldırıldı.")
+                else:
+                    await bot_client.send_message(
+                        DEFAULT_ADMIN_ID,
+                        f"❌ Otomatik satım başarısız!\nToken: `{token_name}`\nSebep: `{sell_reason}`\nHata: `{message}`",
+                        parse_mode='md'
+                    )
+                    logger.error(f"Otomatik satış {token_name} için başarısız oldu: {message}")
+            else:
+                logger.debug(f"{token_name} için satış koşulu karşılanmadı.")
+
+# --- Flask Web Sunucusu ---
+pending_input = {}
+
 @app.route('/')
-def index():
-    if 'logged_in' not in session:
-        return redirect('/login')return render_template_string("""
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Solana Bot Yönetim Paneli</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Inter', sans-serif; }
-        .card {
-            background-color: #1f2937; /* Gray-800 */
-            border-radius: 0.75rem; /* rounded-xl */
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4); /* shadow-2xl */
-            border: 1px solid #6d28d9; /* border-purple-700 */
-        }
-        .btn-primary {
-            background-color: #8b5cf6; /* purple-500 */
-            color: white;
-            padding: 0.75rem 1.5rem;
-            border-radius: 0.5rem;
-            font-weight: 600;
-            transition: background-color 0.3s ease;
-        }
-        .btn-primary:hover {
-            background-color: #7c3aed; /* purple-600 */
-        }
-        .input-field {
-            background-color: #111827; /* gray-900 */
-            border: 1px solid #4b5563; /* gray-600 */
-            color: white;
-            padding: 0.75rem;
-            border-radius: 0.375rem;
-        }
-    </style>
-</head>
-<body class="bg-gradient-to-br from-purple-900 to-indigo-900 text-white min-h-screen flex items-center justify-center p-6">
-    <div class="container mx-auto max-w-4xl space-y-8">
-        <h1 class="text-5xl font-extrabold text-center text-purple-300 mb-10">
-            Solana Bot Yönetim Paneli
-        </h1>
+def root():
+    """Bot durumunu gösteren ana sayfa."""
+    return jsonify(status="ok", message="Bot çalışıyor"), 200
 
-        <div class="grid md:grid-cols-2 gap-8">
-            <!-- Bot Durumu -->
-            <div class="card p-6">
-                <h2 class="text-2xl font-bold mb-4 text-purple-200">Bot Durumu</h2>
-                <div id="bot-status-content">Yükleniyor...</div>
-                <button onclick="fetchStatus()" class="btn-primary mt-4 w-full">Durumu Yenile</button>
-            </div>
+@app.route('/health')
+def health():
+    """Bot sağlık kontrolü uç noktası."""
+    return jsonify(status="ok"), 200
 
-            <!-- Ayarlar -->
-            <div class="card p-6">
-                <h2 class="text-2xl font-bold mb-4 text-purple-200">Ayarlar</h2>
-                <div id="settings-content">Yükleniyor...</div>
-                <button onclick="fetchSettings()" class="btn-primary mt-4 w-full">Ayarları Yenile</button>
-            </div>
-        </div>
+# --- Telethon Yönetici Paneli İşleyicileri ---
 
-        <!-- Açık Pozisyonlar -->
-        <div class="card p-6">
-            <h2 class="text-2xl font-bold mb-4 text-purple-200">Açık Pozisyonlar</h2>
-            <div id="positions-content">Yükleniyor...</div>
-            <button onclick="fetchPositions()" class="btn-primary mt-4 w-full">Pozisyonları Yenile</button>
-        </div>
+@bot_client.on(events.CallbackQuery)
+async def admin_callback_handler(event):
+    """Yönetici panelindeki satır içi düğme tıklamalarını işler."""
+    uid = event.sender_id
+    admins = await get_admins()
+    if uid not in admins:
+        logger.warning(f"Kullanıcı kimliği {uid}'den yetkisiz geri arama sorgusu.")
+        return await event.answer("❌ Yetkiniz yok.")
 
-        <!-- İşlem Geçmişi -->
-        <div class="card p-6">
-            <h2 class="text-2xl font-bold mb-4 text-purple-200">İşlem Geçmişi</h2>
-            <div id="history-content">Yükleniyor...</div>
-            <button onclick="fetchHistory()" class="btn-primary mt-4 w-full">Geçmişi Yenile</button>
-        </div>
-        
-        <div class="text-center mt-8">
-            <button onclick="logout()" class="text-red-400 hover:text-red-300 font-semibold">Çıkış Yap</button>
-        </div>
-    </div>
+    data = event.data.decode()
+    logger.info(f"Yönetici {uid} geri arama tetikledi: {data}")
 
-    <script>
-        async function fetchData(endpoint, targetElementId) {
-            try {
-                const response = await fetch(endpoint);
-                if (!response.ok) {
-                    throw new Error(`HTTP hata! Durum: ${response.status}`);
-                }
-                const data = await response.json();
-                const targetElement = document.getElementById(targetElementId);
-                if (targetElement) {
-                    targetElement.innerHTML = formatData(data, targetElementId);
-                }
-            } catch (error) {
-                console.error(`Veri çekme hatası (${endpoint}):`, error);
-                const targetElement = document.getElementById(targetElementId);
-                if (targetElement) {
-                    targetElement.innerHTML = `<p class="text-red-400">Veri yüklenirken hata oluştu: ${error.message}</p>`;
-                }
-            }
-        }
-
-        function formatData(data, type) {
-            let html = '';
-            if (type === 'bot-status-content') {
-                html += `<p><span class="font-semibold">Bot Durumu:</span> <span class="text-${data.bot_status === 'running' ? 'green' : 'red'}-400">${data.bot_status.toUpperCase()}</span></p>`;
-                html += `<p><span class="font-semibold">Otomatik Alım:</span> <span class="text-${data.auto_buy_enabled === 'enabled' ? 'green' : 'red'}-400">${data.auto_buy_enabled.toUpperCase()}</span></p>`;
-                html += `<p><span class="font-semibold">Otomatik Satış:</span> <span class="text-${data.auto_sell_enabled === 'enabled' ? 'green' : 'red'}-400">${data.auto_sell_enabled.toUpperCase()}</span></p>`;
-                html += `<p><span class="font-semibold">Cüzdan Adresi:</span> <code class="break-all">${data.wallet_address}</code></p>`;
-                html += `<p><span class="font-semibold">SOL Bakiyesi:</span> ${data.sol_balance !== null ? `${data.sol_balance.toFixed(4)} SOL` : 'Alınamadı'}</p>`;
-                html += `<p><span class="font-semibold">Aktif RPC:</span> <code class="break-all">${data.active_rpc || 'Bilinmiyor'}</code></p>`;
-            } else if (type === 'settings-content') {
-                for (const key in data) {
-                    html += `<p><span class="font-semibold">${key}:</span> <code>${data[key]}</code></p>`;
-                }
-            } else if (type === 'positions-content') {
-                if (data.length === 0) {
-                    html = '<p>Açık pozisyon bulunmamaktadır.</p>';
-                } else {
-                    data.forEach(pos => {
-                        const buyTime = new Date(pos.buy_timestamp * 1000).toLocaleString();
-                        html += `
-                            <div class="mb-4 p-3 bg-gray-700 rounded-md">
-                                <p><span class="font-semibold">Token:</span> ${pos.token_name} (<code class="break-all">${pos.contract_address.substring(0,6)}...${pos.contract_address.slice(-4)}</code>)</p>
-                                <p><span class="font-semibold">Alım Fiyatı:</span> ${pos.buy_price_sol.toFixed(8)} SOL/token</p>
-                                <p><span class="font-semibold">Alınan Miktar:</span> ${pos.buy_amount_token.toFixed(4)} token</p>
-                                <p><span class="font-semibold">Kar Hedefi:</span> ${pos.target_profit_x}x, Stop Loss: ${pos.stop_loss_percent}%</p>
-                                <p><span class="font-semibold">Alım Zamanı:</span> ${buyTime}</p>
-                                <p><span class="font-semibold">Alım TX:</span> <a href="https://solscan.io/tx/${pos.buy_tx_signature}" target="_blank" class="text-blue-400 hover:underline">${pos.buy_tx_signature.substring(0,6)}...${pos.buy_tx_signature.slice(-4)}</a></p>
-                            </div>
-                        `;
-                    });
-                }
-            } else if (type === 'history-content') {
-                if (data.length === 0) {
-                    html = '<p>İşlem geçmişi bulunmamaktadır.</p>';
-                } else {
-                    data.forEach(tx => {
-                        const txTime = new Date(tx.timestamp * 1000).toLocaleString();
-                        html += `
-                            <div class="mb-4 p-3 bg-gray-700 rounded-md">
-                                <p><span class="font-semibold">Tür:</span> ${tx.type} | <span class="font-semibold">Durum:</span> <span class="text-${tx.status === 'SUCCESS' ? 'green' : 'red'}-400">${tx.status}</span></p>
-                                <p><span class="font-semibold">Token:</span> ${tx.token_name} (<code class="break-all">${tx.contract_address.substring(0,6)}...${tx.contract_address.slice(-4)}</code>)</p>
-                                <p><span class="font-semibold">SOL Miktarı:</span> ${tx.amount_sol !== null ? tx.amount_sol.toFixed(4) : 'N/A'} | <span class="font-semibold">Token Miktarı:</span> ${tx.amount_token !== null ? tx.amount_token.toFixed(4) : 'N/A'}</p>
-                                <p><span class="font-semibold">Fiyat:</span> ${tx.price_sol_per_token !== null ? tx.price_sol_per_token.toFixed(8) : 'N/A'} SOL/token</p>
-                                <p><span class="font-semibold">Zaman:</span> ${txTime}</p>
-                                <p><span class="font-semibold">TX ID:</span> <a href="https://solscan.io/tx/${tx.tx_signature}" target="_blank" class="text-blue-400 hover:underline">${tx.tx_signature.substring(0,6)}...${tx.tx_signature.slice(-4)}</a></p>
-                                ${tx.error_message ? `<p class="text-red-400"><span class="font-semibold">Hata:</span> ${tx.error_message}</p>` : ''}
-                            </div>
-                        `;
-                    });
-                }
-            }
-            return html;
-        }
-
-        async function fetchStatus() { await fetchData('/api/status', 'bot-status-content'); }
-        async function fetchSettings() { await fetchData('/api/settings', 'settings-content'); }
-        async function fetchPositions() { await fetchData('/api/positions', 'positions-content'); }
-        async function fetchHistory() { await fetchData('/api/history', 'history-content'); }
-
-        function logout() {
-            fetch('/logout', { method: 'POST' })
-                .then(() => window.location.href = '/login');
-        }
-
-        // Sayfa yüklendiğinde verileri çek
-        document.addEventListener('DOMContentLoaded', () => {
-            fetchStatus();
-            fetchSettings();
-            fetchPositions();
-            fetchHistory();
-        });
-    </script>
-</body>
-</html>
-""")@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        # Basit bir şifre kontrolü, üretimde kullanılmamalıdır!
-        # Ortam değişkeni veya güvenli bir yerden alınmalıdır.
-        password = os.environ.get("DASHBOARD_PASSWORD", "adminpassword") 
-        if request.form['password'] == password:
-            session['logged_in'] = True
-            return redirect('/')
-        else:
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="tr">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Giriş Yap</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-                    <style>
-                        body { font-family: 'Inter', sans-serif; }
-                        .card {
-                            background-color: #1f2937; /* Gray-800 */
-                            border-radius: 0.75rem; /* rounded-xl */
-                            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4); /* shadow-2xl */
-                            border: 1px solid #6d28d9; /* border-purple-700 */
-                        }
-                        .btn-primary {
-                            background-color: #8b5cf6; /* purple-500 */
-                            color: white;
-                            padding: 0.75rem 1.5rem;
-                            border-radius: 0.5rem;
-                            font-weight: 600;
-                            transition: background-color 0.3s ease;
-                        }
-                        .btn-primary:hover {
-                            background-color: #7c3aed; /* purple-600 */
-                        }
-                        .input-field {
-                            background-color: #111827; /* gray-900 */
-                            border: 1px solid #4b5563; /* gray-600 */
-                            color: white;
-                            padding: 0.75rem;
-                            border-radius: 0.375rem;
-                        }
-                    </style>
-                </head>
-                <body class="bg-gradient-to-br from-purple-900 to-indigo-900 text-white min-h-screen flex items-center justify-center p-6">
-                    <div class="card p-8 w-full max-w-md text-center">
-                        <h2 class="text-3xl font-bold mb-6 text-purple-300">Yönetim Paneli Girişi</h2>
-                        <p class="text-red-400 mb-4">Yanlış şifre!</p>
-                        <form method="post">
-                            <input type="password" name="password" placeholder="Şifre" class="input-field w-full mb-4" required>
-                            <button type="submit" class="btn-primary w-full">Giriş Yap</button>
-                        </form>
-                    </div>
-                </body>
-                </html>
-            """, error="Yanlış şifre!")
-    return render_template_string("""
-        <!DOCTYPE html>
-        <html lang="tr">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Giriş Yap</title>
-            <script src="https://cdn.tailwindcss.com"></script>
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-            <style>
-                body { font-family: 'Inter', sans-serif; }
-                .card {
-                    background-color: #1f2937; /* Gray-800 */
-                    border-radius: 0.75rem; /* rounded-xl */
-                    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4); /* shadow-2xl */
-                    border: 1px solid #6d28d9; /* border-purple-700 */
-                }
-                .btn-primary {
-                    background-color: #8b5cf6; /* purple-500 */
-                    color: white;
-                    padding: 0.75rem 1.5rem;
-                    border-radius: 0.5rem;
-                    font-weight: 600;
-                    transition: background-color 0.3s ease;
-                }
-                .btn-primary:hover {
-                    background-color: #7c3aed; /* purple-600 */
-                }
-                .input-field {
-                    background-color: #111827; /* gray-900 */
-                    border: 1px solid #4b5563; /* gray-600 */
-                    color: white;
-                    padding: 0.75rem;
-                    border-radius: 0.375rem;
-                }
-            </style>
-        </head>
-        <body class="bg-gradient-to-br from-purple-900 to-indigo-900 text-white min-h-screen flex items-center justify-center p-6">
-            <div class="card p-8 w-full max-w-md text-center">
-                <h2 class="text-3xl font-bold mb-6 text-purple-300">Yönetim Paneli Girişi</h2>
-                <form method="post">
-                    <input type="password" name="password" placeholder="Şifre" class="input-field w-full mb-4" required>
-                    <button type="submit" class="btn-primary w-full">Giriş Yap</button>
-                </form>
-            </div>
-        </body>
-        </html>
-    """)@app.route('/logout', methods=['POST'])
-def logout():
-    session.pop('logged_in', None)
-    return redirect('/login')@app.route('/api/status')
-async def api_status():
-    if 'logged_in' not in session:
-        return jsonify({"error": "Yetkisiz erişim"}), 401bot_status = await get_bot_setting("bot_status")
-auto_buy_enabled = await get_bot_setting("auto_buy_enabled")
-auto_sell_enabled = await get_bot_setting("auto_sell_enabled")
-
-balance = await check_wallet_balance()
-wallet_address = str(payer_keypair.pubkey()) if payer_keypair else "Ayarlanmadı"
-
-return jsonify({
-    "bot_status": bot_status,
-    "auto_buy_enabled": auto_buy_enabled,
-    "auto_sell_enabled": auto_sell_enabled,
-    "wallet_address": wallet_address,
-    "sol_balance": balance,
-    "active_rpc": active_rpc_url
-})@app.route('/api/settings')
-async def api_settings():
-    if 'logged_in' not in session:
-        return jsonify({"error": "Yetkisiz erişim"}), 401settings = {}
-for key in DEFAULT_BOT_SETTINGS.keys():
-    value = await get_bot_setting(key)
-    if key == "SOLANA_PRIVATE_KEY" and value:
-        settings[key] = value[:5] + "..." + value[-5:] # Maskele
-    elif key == "JUPITER_API_KEY" and value:
-        settings[key] = value[:5] + "..." + value[-5:] # Maskele
-    else:
-        settings[key] = value if value is not None else "AYARLANMADI"
-return jsonify(settings)@app.route('/api/positions')
-async def api_positions():
-    if 'logged_in' not in session:
-        return jsonify({"error": "Yetkisiz erişim"}), 401positions = await get_open_positions()
-return jsonify(positions)@app.route('/api/history')
-async def api_history():
-    if 'logged_in' not in session:
-        return jsonify({"error": "Yetkisiz erişim"}), 401history = await get_transaction_history()
-return jsonify(history)# --- Bot ve Flask Başlatma ---
-async def main():
-    # Veritabanını başlat
-    await init_db()# Varsayılan yöneticiyi ekle (eğer yoksa)
-admins = await get_admins()
-if not admins:
-    logger.info(f"Varsayılan yönetici {DEFAULT_ADMIN_ID} ekleniyor.")
-    # Varsayılan yöneticinin adını almak için bir deneme yap
     try:
-        user = await bot_client.get_entity(DEFAULT_ADMIN_ID)
-        first_name = user.first_name if user.first_name else "Varsayılan"
-        last_name = user.last_name if user.last_name else "Yönetici"
-    except Exception:
-        first_name = "Varsayılan"
-        last_name = "Yönetici"
-    await add_admin(DEFAULT_ADMIN_ID, first_name, last_name, is_default=True)
-    await bot_client.send_message(DEFAULT_ADMIN_ID, "Bot başlatıldı ve siz varsayılan yönetici olarak eklendiniz. Ayarlarınızı `/settings` ile yapılandırabilirsiniz.")
+        if data == 'admin_home':
+            return await event.edit(await get_admin_dashboard(),
+                                    buttons=await build_admin_keyboard(), link_preview=False)
+        if data == 'admin_start':
+            await set_bot_setting("bot_status", "running")
+            await event.answer('▶ Bot başlatıldı.')
+            return await event.edit(await get_admin_dashboard(),
+                                    buttons=await build_admin_keyboard(), link_preview=False)
+        if data == 'admin_pause':
+            pending_input[uid] = {'action': 'pause'}
+            kb = [[Button.inline("🔙 Geri", b"admin_home")]]
+            return await event.edit("⏸ *Botu Duraklat*\n\nKaç dakika duraklatmalıyım?",
+                                    buttons=kb, link_preview=False)
+        if data == 'admin_stop':
+            await set_bot_setting("bot_status", "stopped")
+            await event.answer('🛑 Bot durduruldu.')
+            return await event.edit("🛑 *Bot kapatıldı.*",
+                                    buttons=[[Button.inline("🔄 Botu Başlat (çalışır duruma getir)", b"admin_start")],
+                                             [Button.inline("🔙 Geri", b"admin_home")]],
+                                    link_preview=False)
+        
+        if data == 'admin_auto_trade_settings':
+            return await event.edit(await get_admin_dashboard(),
+                                    buttons=await build_auto_trade_keyboard(), link_preview=False)
+        
+        if data == 'admin_enable_auto_buy':
+            if not payer_keypair:
+                await event.answer("❌ Solana özel anahtarı yapılandırılmadı. Otomatik alım etkinleştirilemez.", alert=True)
+                return
+            await set_bot_setting("auto_buy_enabled", "enabled")
+            await event.answer('✅ Otomatik Alım Etkinleştirildi')
+            return await event.edit(await get_admin_dashboard(),
+                                    buttons=await build_auto_trade_keyboard(), link_preview=False)
+        if data == 'admin_disable_auto_buy':
+            await set_bot_setting("auto_buy_enabled", "disabled")
+            await event.answer('❌ Otomatik Alım Devre Dışı Bırakıldı')
+            return await event.edit(await get_admin_dashboard(),
+                                    buttons=await build_auto_trade_keyboard(), link_preview=False)
+        if data == 'admin_set_buy_amount':
+            pending_input[uid] = {'action': 'set_buy_amount'}
+            kb = [[Button.inline("🔙 Geri", b"admin_auto_trade_settings")]]
+            current_amount = await get_bot_setting("buy_amount_sol")
+            return await event.edit(f"💲 *Alım Miktarını Ayarla*\n\nMevcut miktar: `{current_amount} SOL`\n\nHer otomatik alım için harcanacak SOL miktarını girin (örn. `0.01`, `0.05`):",
+                                    buttons=kb, link_preview=False)
+        if data == 'admin_set_slippage':
+            pending_input[uid] = {'action': 'set_slippage'}
+            kb = [[Button.inline("🔙 Geri", b"admin_auto_trade_settings")]]
+            current_slippage = await get_bot_setting("slippage_tolerance")
+            return await event.edit(f"⚙️ *Slippage Toleransını Ayarla*\n\nMevcut slippage: `{current_slippage}%`\n\nKabul edilebilir maksimum fiyat slippage'ını yüzde olarak girin (örn. `1`, `5`, `10`):",
+                                    buttons=kb, link_preview=False)
+        
+        if data == 'admin_enable_auto_sell':
+            await set_bot_setting("auto_sell_enabled", "enabled")
+            await event.answer('✅ Otomatik Satış Etkinleştirildi')
+            return await event.edit(await get_admin_dashboard(),
+                                    buttons=await build_auto_trade_keyboard(), link_preview=False)
+        if data == 'admin_disable_auto_sell':
+            await set_bot_setting("auto_sell_enabled", "disabled")
+            await event.answer('❌ Otomatik Satış Devre Dışı Bırakıldı')
+            return await event.edit(await get_admin_dashboard(),
+                                    buttons=await build_auto_trade_keyboard(), link_preview=False)
+        if data == 'admin_set_profit_target':
+            pending_input[uid] = {'action': 'set_profit_target'}
+            kb = [[Button.inline("🔙 Geri", b"admin_auto_trade_settings")]]
+            current_target = await get_bot_setting("profit_target_x")
+            return await event.edit(f"📈 *Kar Hedefini Ayarla*\n\nMevcut hedef: `{current_target}x`\n\nSatıştan önce token fiyatının kaç kat artması gerektiğini girin (örn. 2x için `2.0`, 5x için `5.0`):",
+                                    buttons=kb, link_preview=False)
+        if data == 'admin_set_stop_loss':
+            pending_input[uid] = {'action': 'set_stop_loss'}
+            kb = [[Button.inline("🔙 Geri", b"admin_auto_trade_settings")]]
+            current_stop_loss = await get_bot_setting("stop_loss_percent")
+            return await event.edit(f"📉 *Stop-Loss Yüzdesini Ayarla*\n\nMevcut stop-loss: `{current_stop_loss}%`\n\nAlış fiyatından yüzde kaç düşüşte satılacağını girin (örn. %10 düşüş için `10`, %50 düşüş için `50`):",
+                                    buttons=kb, link_preview=False)
+        
+        if data == 'admin_admins':
+            admins = await get_admins()
+            kb = [
+                [Button.inline("➕ Yönetici Ekle", b"admin_add_admin")],
+            ]
+            removable_admins = {aid: info for aid, info in admins.items() if aid != DEFAULT_ADMIN_ID and not info.get("is_default")}
+            if removable_admins:
+                kb.append([Button.inline("🗑 Yönetici Kaldır", b"admin_show_remove_admins")])
+            kb.append([Button.inline("🔙 Geri", b"admin_home")])
+            return await event.edit("👤 *Yöneticileri Yönet*", buttons=kb, link_preview=False)
+        if data == 'admin_show_remove_admins':
+            admins = await get_admins()
+            kb = []
+            for aid, info in admins.items():
+                if aid != DEFAULT_ADMIN_ID and not info.get("is_default"):
+                    kb.append([Button.inline(f"{info.get('first_name', 'N/A')} ({aid})", b"noop"),
+                                 Button.inline("❌ Kaldır", f"remove_admin:{aid}".encode())])
+            kb.append([Button.inline("🔙 Geri", b"admin_admins")])
+            if not kb:
+                return await event.edit("🗑 *Kaldırılabilir yönetici bulunamadı.*",
+                                       buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
+            return await event.edit("🗑 *Kaldırılacak Yöneticiyi Seç*", buttons=kb, link_preview=False)
+        if data == 'admin_add_admin':
+            pending_input[uid] = {'action': 'confirm_add_admin'}
+            return await event.edit("➕ *Yönetici Ekle*\n\nEklenecek kullanıcı kimliğini gönderin:",
+                                    buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
+        if data.startswith('remove_admin:'):
+            aid = int(data.split(':')[1])
+            await remove_admin(aid)
+            await event.answer("✅ Yönetici kaldırıldı", alert=True)
+            admins = await get_admins()
+            kb = []
+            for admin_id, info in admins.items():
+                if admin_id != DEFAULT_ADMIN_ID and not info.get("is_default"):
+                    kb.append([Button.inline(f"{info.get('first_name', 'N/A')} ({admin_id})", b"noop"),
+                                 Button.inline("❌ Kaldır", f"remove_admin:{admin_id}".encode())])
+            kb.append([Button.inline("🔙 Geri", b"admin_admins")])
+            if not kb:
+                return await event.edit("🗑 *Kaldırılabilir yönetici bulunamadı.*",
+                                       buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
+            return await event.edit("🗑 *Kaldırılacak Yöneticiyi Seç*", buttons=kb, link_preview=False)
+        
+        if data == 'admin_wallet_settings':
+            return await event.edit(await get_wallet_settings_dashboard(),
+                                    buttons=await build_wallet_settings_keyboard(), link_preview=False)
+        if data == 'admin_set_wallet_private_key':
+            pending_input[uid] = {'action': 'set_wallet_private_key'}
+            kb = [[Button.inline("🔙 Geri", b"admin_wallet_settings")]]
+            return await event.edit(
+                "⚠️ *DİKKAT: ÇOK HASSAS BİLGİ!* ⚠️\n\n"
+                "Lütfen Solana özel anahtarınızı (Base58 formatında) girin. "
+                "Bu anahtar, bot'a cüzdanınıza erişim izni verir. "
+                "Yanlış veya kötü niyetli kullanımda fonlarınız risk altında olabilir.\n\n"
+                "Yeni özel anahtarınızı buraya yapıştırın:",
+                buttons=kb, parse_mode='md', link_preview=False
+            )
+        if data == 'admin_transaction_history':
+            history = await get_transaction_history()
+            if not history:
+                history_text = "📜 *İşlem Geçmişi*\n\nHenüz işlem bulunamadı."
+            else:
+                history_text = "📜 *Son 20 İşlem*\n\n"
+                for tx in history:
+                    status_emoji = "✅" if tx['status'] == 'success' else "❌"
+                    tx_type_emoji = "⬆️" if tx['type'] == 'buy' else "⬇️"
+                    tx_time = datetime.fromtimestamp(tx['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+                    tx_sig_short = tx['tx_signature'][:6] + "..." + tx['tx_signature'][-4:] if tx['tx_signature'] and tx['tx_signature'] != "N/A" else "N/A"
+                    contract_addr_short = tx['contract_address'][:6] + "..." + tx['contract_address'][-4:] if tx['contract_address'] else "N/A"
 
-# Varsayılan ayarları veritabanına kaydet (eğer yoksa)
-for key, default_value in DEFAULT_BOT_SETTINGS.items():
-    current_value = await get_bot_setting(key)
-    if current_value is None:
-        await set_bot_setting(key, default_value)
-        logger.info(f"Varsayılan ayar '{key}' '{default_value}' olarak kaydedildi.")
+                    history_text += (
+                        f"{status_emoji} {tx_type_emoji} `{tx_time}`\n"
+                        f"  Token: *{tx['token_name']}*\n"
+                        f"  Sözleşme: `{contract_addr_short}`\n"
+                        f"  Miktar: `{tx['amount_token']:.4f}` Token / `{tx['amount_sol']:.4f}` SOL\n"
+                        f"  Fiyat: `{tx['price_sol_per_token']:.8f}` SOL/Token\n"
+                        f"  TX: `{tx_sig_short}`\n"
+                    )
+                    if tx['error_message']:
+                        history_text += f"  Hata: `{tx['error_message']}`\n"
+                    history_text += "\n"
+            
+            kb = [[Button.inline("🔙 Geri", b"admin_home")]]
+            return await event.edit(history_text, buttons=kb, parse_mode='md', link_preview=False)
 
-# Solana istemcisini başlat
-await init_solana_client()
+        await event.answer("Bilinmeyen eylem.")
 
-# Telegram botunu başlat
-logger.info("Telegram botu başlatılıyor...")
-await bot_client.start(bot_token=BOT_TOKEN)
-logger.info("Telegram botu başarıyla başlatıldı.")
+    except Exception as e:
+        logger.error(f"Yönetici {uid}, veri {data} için admin_callback_handler'da hata: {e}")
+        await event.answer("❌ Bir hata oluştu.")
+        await event.edit(f"❌ Bir hata oluştu: {e}", buttons=[[Button.inline("🔙 Geri", b"admin_home")]], parse_mode='md', link_preview=False)
 
-# Arka plan görevlerini başlat
-asyncio.create_task(monitor_open_positions())
-logger.info("Pozisyon izleme görevi başlatıldı.")
+@bot_client.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    """Bot başlatıldığında veya /start komutu alındığında çalışır."""
+    uid = event.sender_id
+    admins = await get_admins()
+    if uid not in admins:
+        if not admins:
+            await add_admin(uid, event.sender.first_name, event.sender.last_name, is_default=True)
+            logger.info(f"Varsayılan yönetici olarak ayarlandı: {uid}")
+            await event.reply("🎉 Hoş geldiniz! Varsayılan yönetici olarak ayarlandınız. Botu yönetmek için `/admin` komutunu kullanın.")
+        else:
+            logger.warning(f"Kullanıcı kimliği {uid}'den yetkisiz /start komutu.")
+            return await event.reply("❌ Bu botu kullanmaya yetkiniz yok.")
+    
+    await event.reply(await get_admin_dashboard(), buttons=await build_admin_keyboard(), parse_mode='md', link_preview=False)
 
-# Botu sürekli çalışır durumda tut
-await bot_client.run_until_disconnected()def run_flask():
-    # Flask uygulamasını ayrı bir thread'de çalıştır
-    # debug=True, production için uygun değildir.
-    app.run(host='0.0.0.0', port=5000, debug=False)if __name__ == '__main__':
-    # Flask'ı ayrı bir thread'de başlat
+@bot_client.on(events.NewMessage(pattern='/admin'))
+async def admin_handler(event):
+    """/admin komutu alındığında yönetici panelini gösterir."""
+    uid = event.sender_id
+    admins = await get_admins()
+    if uid not in admins:
+        logger.warning(f"Kullanıcı kimliği {uid}'den yetkisiz /admin komutu.")
+        return await event.reply("❌ Yönetici paneline erişmeye yetkiniz yok.")
+    
+    await event.reply(await get_admin_dashboard(), buttons=await build_admin_keyboard(), parse_mode='md', link_preview=False)
+
+async def get_admin_dashboard():
+    """Yönetici paneli için gösterge tablosu metnini oluşturur."""
+    bot_status = await get_bot_setting("bot_status")
+    auto_buy_status = await get_bot_setting("auto_buy_enabled")
+    buy_amount = await get_bot_setting("buy_amount_sol")
+    slippage = await get_bot_setting("slippage_tolerance")
+    auto_sell_status = await get_bot_setting("auto_sell_enabled")
+    profit_target = await get_bot_setting("profit_target_x")
+    stop_loss = await get_bot_setting("stop_loss_percent")
+
+    dashboard_text = (
+        "⚙️ *Yönetici Paneli*\n\n"
+        f"🤖 Bot Durumu: *{bot_status.upper()}*\n"
+        f"💰 Otomatik Alım: *{auto_buy_status.upper()}*\n"
+        f"  - Alım Miktarı: `{buy_amount} SOL`\n"
+        f"  - Slippage Toleransı: `{slippage}%`\n"
+        f"📈 Otomatik Satış: *{auto_sell_status.upper()}*\n"
+        f"  - Kar Hedefi: `{profit_target}x`\n"
+        f"  - Stop-Loss: `{stop_loss}%`\n"
+    )
+    return dashboard_text
+
+async def get_wallet_settings_dashboard():
+    """Cüzdan ayarları paneli için gösterge tablosu metnini oluşturur."""
+    wallet_pubkey = "N/A"
+    wallet_balance = "N/A"
+    if payer_keypair:
+        wallet_pubkey = str(payer_keypair.pubkey())
+        balance = await check_wallet_balance() # Yeni check_wallet_balance fonksiyonunu kullan
+        if balance is not None:
+            wallet_balance = f"{balance:.4f} SOL"
+        else:
+            wallet_balance = "Bakiye alınamadı (Hata)"
+
+    dashboard_text = (
+        "💳 *Cüzdan Ayarları*\n\n"
+        f"Aktif Cüzdan Genel Anahtarı: `{wallet_pubkey}`\n"
+        f"Bakiye: `{wallet_balance}`\n\n"
+        "⚠️ *Özel anahtarınızı girerken çok dikkatli olun! Bu anahtar, bot'a cüzdanınıza tam erişim izni verir. "
+        "Yanlış veya kötü niyetli kullanımda fonlarınız risk altında olabilir.*"
+    )
+    return dashboard_text
+
+async def build_admin_keyboard():
+    """Yönetici paneli için ana klavyeyi oluşturur."""
+    bot_status = await get_bot_setting("bot_status")
+    
+    keyboard = [
+        [Button.inline("👤 Yöneticiler", b"admin_admins"), Button.inline("💳 Cüzdan Ayarları", b"admin_wallet_settings")],
+        [Button.inline("📈 Otomatik Alım-Satım Ayarları", b"admin_auto_trade_settings")],
+        [Button.inline("📜 İşlem Geçmişi", b"admin_transaction_history")]
+    ]
+    
+    if bot_status == "running":
+        keyboard.append([Button.inline("⏸ Botu Duraklat", b"admin_pause"), Button.inline("🛑 Botu Durdur", b"admin_stop")])
+    else:
+        keyboard.append([Button.inline("▶ Botu Başlat", b"admin_start")])
+    
+    return keyboard
+
+async def build_auto_trade_keyboard():
+    """Otomatik alım-satım ayarları klavyesini oluşturur."""
+    auto_buy_status = await get_bot_setting("auto_buy_enabled")
+    auto_sell_status = await get_bot_setting("auto_sell_enabled")
+    
+    keyboard = []
+    if auto_buy_status == "enabled":
+        keyboard.append([Button.inline("❌ Otomatik Alımı Devre Dışı Bırak", b"admin_disable_auto_buy")])
+    else:
+        keyboard.append([Button.inline("✅ Otomatik Alımı Etkinleştir", b"admin_enable_auto_buy")])
+    
+    keyboard.append([
+        Button.inline("💲 Alım Miktarını Ayarla", b"admin_set_buy_amount"),
+        Button.inline("⚙️ Slippage Toleransını Ayarla", b"admin_set_slippage")
+    ])
+
+    if auto_sell_status == "enabled":
+        keyboard.append([Button.inline("❌ Otomatik Satışı Devre Dışı Bırak", b"admin_disable_auto_sell")])
+    else:
+        keyboard.append([Button.inline("✅ Otomatik Satışı Etkinleştir", b"admin_enable_auto_sell")])
+    
+    keyboard.append([
+        Button.inline("📈 Kar Hedefini Ayarla", b"admin_set_profit_target"),
+        Button.inline("📉 Stop-Loss Ayarla", b"admin_set_stop_loss")
+    ])
+
+    keyboard.append([Button.inline("🔙 Geri", b"admin_home")])
+    
+    return keyboard
+
+async def build_wallet_settings_keyboard():
+    """Cüzdan ayarları klavyesini oluşturur."""
+    keyboard = [
+        [Button.inline("🔑 Yeni Özel Anahtar Ayarla", b"admin_set_wallet_private_key")],
+        [Button.inline("🔙 Geri", b"admin_home")]
+    ]
+    return keyboard
+
+@bot_client.on(events.NewMessage)
+async def handle_admin_input(event):
+    """Yöneticilerden gelen metin girişlerini (ayarları değiştirmek için) işler."""
+    uid = event.sender_id
+    admins = await get_admins()
+    if uid not in admins:
+        return
+
+    text_input = event.message.text
+    if text_input and text_input.startswith('/'):
+        if uid in pending_input:
+            del pending_input[uid]
+        return
+
+    if uid in pending_input:
+        action_data = pending_input[uid]
+        action = action_data['action']
+        
+        if action == 'pause':
+            try:
+                minutes = int(text_input)
+                await set_bot_setting("bot_status", f"paused:{time.time() + minutes*60}")
+                await event.reply(f"✅ Bot {minutes} dakika duraklatıldı.")
+                logger.info(f"Yönetici {uid} tarafından bot {minutes} dakika duraklatıldı.")
+            except ValueError:
+                await event.reply("❌ Geçersiz giriş. Lütfen dakika için bir sayı girin.")
+            finally:
+                del pending_input[uid]
+            return await event.reply(await get_admin_dashboard(),
+                                     buttons=await build_admin_keyboard(), parse_mode='md', link_preview=False)
+        
+        elif action == 'confirm_add_admin':
+            try:
+                new_admin_id = int(text_input)
+                await add_admin(new_admin_id, f"User_{new_admin_id}", "")
+                await event.reply(f"✅ Yönetici {new_admin_id} eklendi.")
+                logger.info(f"Yönetici {uid} yeni yönetici {new_admin_id} ekledi.")
+            except ValueError:
+                await event.reply("❌ Geçersiz kullanıcı kimliği. Lütfen sayısal bir kullanıcı kimliği girin.")
+            except Exception as e:
+                await event.reply(f"❌ Yönetici eklenirken hata: {e}")
+                logger.error(f"Yönetici {text_input} eklenirken hata: {e}")
+            finally:
+                del pending_input[uid]
+            return await event.reply(await get_admin_dashboard(),
+                                     buttons=await build_admin_keyboard(), parse_mode='md', link_preview=False)
+        
+        elif action == 'set_buy_amount':
+            try:
+                amount = float(text_input)
+                if amount <= 0:
+                    raise ValueError("Miktar pozitif olmalıdır.")
+                await set_bot_setting("buy_amount_sol", str(amount))
+                await event.reply(f"✅ Otomatik alım miktarı `{amount} SOL` olarak ayarlandı.")
+                logger.info(f"Yönetici {uid} otomatik alım miktarını {amount} SOL olarak ayarladı.")
+            except ValueError:
+                await event.reply("❌ Geçersiz miktar. Lütfen pozitif bir sayı girin (örn. `0.01`, `0.5`).")
+            finally:
+                del pending_input[uid]
+            return await event.reply(await get_admin_dashboard(),
+                                     buttons=await build_auto_trade_keyboard(), parse_mode='md', link_preview=False)
+        
+        elif action == 'set_slippage':
+            try:
+                slippage = float(text_input)
+                if not (0 <= slippage <= 100):
+                    raise ValueError("Slippage toleransı 0 ile 100 arasında olmalıdır.")
+                await set_bot_setting("slippage_tolerance", str(slippage))
+                await event.reply(f"✅ Slippage toleransı `{slippage}%` olarak ayarlandı.")
+                logger.info(f"Yönetici {uid} slippage toleransını {slippage}% olarak ayarladı.")
+            finally:
+                del pending_input[uid]
+            return await event.reply(await get_admin_dashboard(),
+                                     buttons=await build_auto_trade_keyboard(), parse_mode='md', link_preview=False)
+        
+        elif action == 'set_profit_target':
+            try:
+                target_x = float(text_input)
+                if target_x <= 1.0:
+                    raise ValueError("Kar hedefi 1.0'dan büyük olmalıdır (örn. 2x için 2.0).")
+                await set_bot_setting("profit_target_x", str(target_x))
+                await event.reply(f"✅ Kar hedefi `{target_x}x` olarak ayarlandı.")
+                logger.info(f"Yönetici {uid} kar hedefini {target_x}x olarak ayarladı.")
+            finally:
+                del pending_input[uid]
+            return await event.reply(await get_admin_dashboard(),
+                                     buttons=await build_auto_trade_keyboard(), parse_mode='md', link_preview=False)
+        
+        elif action == 'set_stop_loss':
+            try:
+                stop_loss = float(text_input)
+                if not (0 <= stop_loss < 100):
+                    raise ValueError("Stop-loss 0 ile 100 arasında olmalıdır (100 hariç).")
+                await set_bot_setting("stop_loss_percent", str(stop_loss))
+                await event.reply(f"✅ Stop-loss `{stop_loss}%` olarak ayarlandı.")
+                logger.info(f"Yönetici {uid} stop-loss'u {stop_loss}% olarak ayarladı.")
+            finally:
+                del pending_input[uid]
+            return await event.reply(await get_admin_dashboard(),
+                                     buttons=await build_auto_trade_keyboard(), parse_mode='md', link_preview=False)
+        
+        elif action == 'set_wallet_private_key':
+            try:
+                new_private_key = text_input.strip()
+                if not new_private_key:
+                    raise ValueError("Özel anahtar boş olamaz.")
+                
+                await set_bot_setting("SOLANA_PRIVATE_KEY", new_private_key)
+                
+                # Yeni anahtarla Solana istemcisini ve anahtar çiftini yeniden başlat
+                await init_solana_client()
+
+                test_keypair = None
+                try:
+                    test_keypair = Keypair.from_base58_string(new_private_key)
+                except Exception as e:
+                    await event.reply(f"❌ Girilen özel anahtar geçersiz formatta: {e}")
+                    logger.error(f"Yönetici {uid} tarafından girilen geçersiz özel anahtar formatı: {e}")
+                    return await event.reply(await get_wallet_settings_dashboard(),
+                                             buttons=await build_wallet_settings_keyboard(), parse_mode='md', link_preview=False)
+
+                if payer_keypair and str(payer_keypair.pubkey()) == str(test_keypair.pubkey()):
+                     await event.reply(f"✅ Yeni özel anahtar başarıyla ayarlandı. Yeni Genel Anahtar: `{payer_keypair.pubkey()}`")
+                     logger.info(f"Yönetici {uid} yeni Solana özel anahtarını ayarladı.")
+                else:
+                    await event.reply("❌ Özel anahtar ayarlanırken bir sorun oluştu veya anahtar geçersiz.")
+                    logger.error(f"Yönetici {uid} için yeni özel anahtar ayarlanamadı.")
+
+            except ValueError as ve:
+                await event.reply(f"❌ Geçersiz özel anahtar formatı: {ve}")
+            except Exception as e:
+                await event.reply(f"❌ Özel anahtar ayarlanırken hata: {e}")
+                logger.error(f"Yönetici {uid} için yeni özel anahtar ayarlanırken hata: {e}")
+            finally:
+                del pending_input[uid]
+            return await event.reply(await get_wallet_settings_dashboard(),
+                                     buttons=await build_wallet_settings_keyboard(), parse_mode='md', link_preview=False)
+
+# --- Telegram Mesaj İşleyici (Sinyal Kanalı) ---
+@bot_client.on(events.NewMessage(chats=SOURCE_CHANNEL_ID))
+async def handle_incoming_signal(event):
+    """Belirlenen kaynak kanalından gelen yeni mesajları işler."""
+    message_text = event.message.text
+    if not message_text:
+        logger.debug("Boş mesaj metni alındı. Atlanıyor.")
+        return
+
+    logger.info(f"Kaynak kanal {event.chat_id}'den mesaj alındı: {message_text[:100]}...")
+
+    bot_status = await get_bot_setting("bot_status")
+    if bot_status == "stopped":
+        logger.info("Bot durduruldu. Mesaj işleme atlanıyor.")
+        return
+    if bot_status.startswith("paused"):
+        pause_until_timestamp = float(bot_status.split(":")[1])
+        if time.time() < pause_until_timestamp:
+            logger.info("Bot duraklatıldı. Mesaj işleme atlanıyor.")
+            return
+        else:
+            await set_bot_setting("bot_status", "running")
+            logger.info("Bot duraklatma sona erdi. İşlemler devam ediyor.")
+
+    contract_address = extract_contract(message_text)
+    token_name = extract_token_name_from_message(message_text)
+
+    if contract_address:
+        logger.info(f"Sözleşme adresi bulundu: {contract_address}. Otomatik alım başlatılıyor.")
+        
+        auto_buy_enabled = await get_bot_setting("auto_buy_enabled")
+        if auto_buy_enabled == "enabled":
+            buy_amount_sol_str = await get_bot_setting("buy_amount_sol")
+            slippage_tolerance_str = await get_bot_setting("slippage_tolerance")
+            profit_target_x_str = await get_bot_setting("profit_target_x")
+            stop_loss_percent_str = await get_bot_setting("stop_loss_percent")
+            
+            try:
+                buy_amount_sol = float(buy_amount_sol_str)
+                slippage_tolerance_percent = float(slippage_tolerance_str)
+                profit_target_x = float(profit_target_x_str)
+                stop_loss_percent = float(stop_loss_percent_str)
+            except ValueError:
+                logger.error("Otomatik alım-satım ayarları geçersiz. Lütfen kontrol edin.")
+                await bot_client.send_message(DEFAULT_ADMIN_ID, "❌ Otomatik alım-satım ayarları geçersiz. Lütfen kontrol edin.", parse_mode='md')
+                return
+
+            success, result_message, actual_buy_price_sol, bought_amount_token = await auto_buy_token(
+                contract_address, token_name, buy_amount_sol, slippage_tolerance_percent
+            )
+            
+            admin_message = f"💰 Otomatik Alım Durumu: {result_message}"
+            await bot_client.send_message(DEFAULT_ADMIN_ID, admin_message, parse_mode='md')
+            
+            if success:
+                await add_open_position(
+                    contract_address, 
+                    token_name, 
+                    actual_buy_price_sol, 
+                    bought_amount_token, 
+                    result_message.split("Tx: ")[1] if "Tx: " in result_message else "N/A",
+                    profit_target_x, 
+                    stop_loss_percent
+                )
+                logger.info(f"Token {token_name} için açık pozisyon kaydedildi.")
+            else:
+                logger.warning(f"{contract_address} için otomatik alım başarısız oldu: {result_message}")
+        else:
+            logger.info(f"Otomatik alım devre dışı. {contract_address} için alım denenmiyor.")
+    else:
+        logger.debug(f"{event.chat_id}'den gelen mesajda sözleşme adresi bulunamadı.")
+
+# --- Bot Başlangıcı ---
+
+async def main():
+    """Botu başlatır, veritabanını ve Solana istemcisini başlatır."""
+    await init_db()
+    
+    admins = await get_admins()
+    if not admins:
+        await add_admin(DEFAULT_ADMIN_ID, "Default", "Admin", is_default=True)
+        logger.info(f"Varsayılan yönetici {DEFAULT_ADMIN_ID} eklendi.")
+    
+    for setting_key, default_value in DEFAULT_BOT_SETTINGS.items():
+        current_value = await get_bot_setting(setting_key)
+        if current_value is None:
+            await set_bot_setting(setting_key, default_value)
+            logger.info(f"Varsayılan ayar {setting_key} -> {default_value} ayarlandı.")
+        else:
+            # Özel anahtar ise maskele
+            if setting_key == "SOLANA_PRIVATE_KEY":
+                masked_value = '*' * (len(current_value) - 4) + current_value[-4:] if len(current_value) > 4 else '*' * len(current_value)
+                logger.info(f"Ayar {setting_key} zaten mevcut (maskeli): {masked_value}")
+            else:
+                logger.info(f"Ayar {setting_key} zaten mevcut: {current_value}")
+
+    await init_solana_client()
+
+    logger.info("Telegram istemcisi bağlanıyor...")
+    await bot_client.start(bot_token=BOT_TOKEN)
+    logger.info("Telegram istemcisi bağlandı.")
+
+    me_bot = await bot_client.get_me()
+    logger.info(f"Otomatik Alım-Satım Botu: @{me_bot.username} ({me_bot.id})")
+    logger.info(f"Otomatik Alım-Satım Botu şu anda kanal kimliğini dinliyor: {SOURCE_CHANNEL_ID}")
+    logger.info(f"Otomatik Alım Miktarı: {await get_bot_setting('buy_amount_sol')} SOL")
+    logger.info(f"Slippage Toleransı: {await get_bot_setting('slippage_tolerance')}%")
+    logger.info(f"Kar Hedefi: {await get_bot_setting('profit_target_x')}x")
+    logger.info(f"Stop-Loss: {await get_bot_setting('stop_loss_percent')}%")
+
+    asyncio.create_task(monitor_positions_task())
+    logger.info("Pozisyon izleme görevi başlatıldı.")
+
+    def run_flask():
+        app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+
     flask_thread = threading.Thread(target=run_flask)
-    flask_thread.start()# asyncio olay döngüsünü başlat ve botu çalıştır
-try:
-    asyncio.run(main())
-except KeyboardInterrupt:
-    logger.info("Bot manuel olarak durduruldu.")
-except Exception as e:
-    logger.critical(f"Ana bot döngüsünde kritik hata: {e}", exc_info=True)
+    flask_thread.start()
+    logger.info("Flask web sunucusu başlatıldı.")
 
+    logger.info("Bot çalışıyor. Durdurmak için Ctrl+C tuşlarına basın.")
+    await bot_client.run_until_disconnected()
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot kullanıcı tarafından durduruldu.")
+    except Exception as e:
+        logger.critical(f"Beklenmeyen bir hata oluştu: {e}", exc_info=True)
