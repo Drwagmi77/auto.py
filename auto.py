@@ -21,7 +21,7 @@ from solana.rpc.api import Client, RPCException
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction # VersionedTransaction hala kullanılabilir, ancak doğrudan imzalanmayacak
+from solders.transaction import VersionedTransaction 
 from solders.message import MessageV0
 from solders.instruction import Instruction
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
@@ -59,14 +59,25 @@ payer_keypair = None
 async def get_balance_with_retry(pubkey: Pubkey, retries=3):
     """
     Solana bakiyesini tekrar deneme mekanizmasıyla alır.
+    Hem GetBalanceResp nesnesini hem de doğrudan dict yanıtını işler.
     """
     for i in range(retries):
         try:
             resp = await asyncio.to_thread(solana_client.get_balance, pubkey)
+            
+            # Eğer beklenen GetBalanceResp nesnesiyse
             if isinstance(resp, GetBalanceResp):
                 return resp.value
+            # Eğer bir sözlükse, raw JSON RPC yanıtı olarak ayrıştırmaya çalış
+            elif isinstance(resp, dict):
+                if 'result' in resp and 'value' in resp['result']:
+                    return resp['result']['value']
+                elif 'error' in resp:
+                    logger.warning(f"RPC Error in dict response for get_balance: {resp['error']}. Attempt {i+1}/{retries}")
+                else:
+                    logger.warning(f"Unexpected dict structure for get_balance: {resp}. Attempt {i+1}/{retries}")
             else:
-                logger.warning(f"Unexpected response type for get_balance: {type(resp)}. Attempt {i+1}/{retries}")
+                logger.warning(f"Unexpected response type for get_balance: {type(resp)}. Full response: {resp}. Attempt {i+1}/{retries}")
         except Exception as e:
             logger.warning(f"Balance check attempt {i+1}/{retries} failed: {e}")
             await asyncio.sleep(1) # Kısa bir bekleme süresi
@@ -521,7 +532,7 @@ async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check
         input_mint = token_mint
         output_mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
 
-        token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint) # input_mint kullanıldı
+        token_info = await asyncio.to_thread(solana_client.get_token_supply, input_mint) 
         if not token_info or not hasattr(token_info, 'value') or not hasattr(token_info.value, 'decimals'):
             logger.warning(f"{token_mint_str} için token arz bilgisi alınamadı. Ondalıklar belirlenemiyor.")
             return None
@@ -876,7 +887,7 @@ async def admin_callback_handler(event):
             await event.answer('🛑 Bot durduruldu.')
             return await event.edit("🛑 *Bot kapatıldı.*",
                                     buttons=[[Button.inline("🔄 Botu Başlat (çalışır duruma getir)", b"admin_start")],
-                                             [Button.inline("🔙 Geri", b"admin_home")]],
+                                             [Button.inline("� Geri", b"admin_home")]],
                                     link_preview=False)
         
         if data == 'admin_auto_trade_settings':
@@ -952,7 +963,7 @@ async def admin_callback_handler(event):
             kb.append([Button.inline("🔙 Geri", b"admin_admins")])
             if not kb:
                 return await event.edit("🗑 *Kaldırılabilir admin yok.*",
-                                       buttons=[[Button.inline("� Geri", b"admin_admins")]], link_preview=False)
+                                       buttons=[[Button.inline("🔙 Geri", b"admin_admins")]], link_preview=False)
             return await event.edit("🗑 *Kaldırılacak Admini Seç*", buttons=kb, link_preview=False)
         if data == 'admin_add_admin':
             pending_input[uid] = {'action': 'confirm_add_admin'}
