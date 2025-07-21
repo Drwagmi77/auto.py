@@ -3,5 +3,5 @@ solana
 requests
 psycopg2-binary
 tweepy
-Flask>=2.3.0
+Flask[async]
 greenlet>=3.0.0
