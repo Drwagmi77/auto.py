@@ -79,7 +79,7 @@ last_jupiter_call_time = 0
 JUPITER_RATE_LIMIT_DELAY = 2.0 # Her Jupiter API çağrısı arasında en az 2.0 saniye bekle (artırıldı)
 
 # Jupiter API çağrıları için Semaphore (eşzamanlı istekleri sınırlamak için)
-JUPITER_SEMAPHORE = asyncio.Semaphore(3) # Maksimum 3 eşzamanlı Jupiter API isteği
+JUPITER_SEMAPHORE = asyncio.Semaphore(2) # Maksimum 3 eşzamanlı Jupiter API isteği
 
 # Jupiter teklifleri için cache (5 dakika TTL'li, 100 token sakla)
 QUOTE_CACHE = TTLCache(maxsize=100, ttl=300)
@@ -657,7 +657,7 @@ async def get_current_token_price_sol(token_mint_str: str, amount_token_to_check
                         logger.info(f"429 hatası, {delay:.2f} saniye beklenecek.")
                         await bot_client.send_message(
                             DEFAULT_ADMIN_ID,
-                            "⚠️ **Jupiter API Rate Limit Aşıldı!**\n"
+                            # await send_telegram_message(DEFAULT_ADMIN_ID, f"⚠️ **Rate Limit Aşıldı!**\nJupiter API'sinde oran sınırı aşıldı. Bot {wait_time:.2f} saniye bekleyecek.\nDeneme: {attempt}/{max_retries}") 
                             f"Son hata: `{e}`\n"
                             f"Bot {delay:.2f} saniye bekleyecek.",
                             parse_mode='md'
