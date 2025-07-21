@@ -14,7 +14,7 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from flask import Flask, jsonify, request, redirect, session, render_template_string
 import threading
 from datetime import datetime
-import base64 # Yeni eklendi: Base64 kod çözme için
+import base64 # Base64 kod çözme için
 
 # Solana Kütüphaneleri
 from solana.rpc.api import Client, RPCException
@@ -404,9 +404,7 @@ async def remove_open_position(contract_address):
     await asyncio.to_thread(remove_open_position_sync, contract_address)
 
 async def add_transaction_history(*args):
-    # args'ı doğrudan add_transaction_history_sync'e iletiyoruz.
     # Bu wrapper fonksiyonu, add_transaction_history_sync'in beklediği tüm argümanları doğru sırada almalıdır.
-    # error_message'ın pozisyonel olarak geçirilmesi gerekiyor.
     await asyncio.to_thread(add_transaction_history_sync, *args)
 
 async def get_transaction_history():
@@ -562,12 +560,12 @@ async def perform_swap(quote_data: dict):
             return False, "Invalid swap transaction data.", None
 
         serialized_tx = swap_data["swapTransaction"]
-        # Base64 string'i byte'a dönüştürmek için base64.b64decode kullanıldı
         transaction = VersionedTransaction.from_bytes(base64.b64decode(serialized_tx))
         
-        transaction.sign([payer_keypair])
-
-        tx_signature = await asyncio.to_thread(solana_client.send_transaction, transaction, opts=TxOpts(skip_preflight=True))
+        # transaction.sign([payer_keypair]) satırı kaldırıldı
+        
+        # send_transaction metoduna payer_keypair doğrudan imzalayıcı olarak geçirildi
+        tx_signature = await asyncio.to_thread(solana_client.send_transaction, transaction, payer_keypair, opts=TxOpts(skip_preflight=True))
         logger.info(f"Swap transaction sent: {tx_signature['result']}")
 
         confirmation = await asyncio.to_thread(solana_client.confirm_transaction, tx_signature['result'], commitment="confirmed")
@@ -819,7 +817,7 @@ async def admin_callback_handler(event):
             await event.answer('🛑 Bot durduruldu.')
             return await event.edit("🛑 *Bot kapatıldı.*",
                                     buttons=[[Button.inline("🔄 Botu Başlat (çalışır duruma getir)", b"admin_start")],
-                                             [Button.inline("� Geri", b"admin_home")]],
+                                             [Button.inline("🔙 Geri", b"admin_home")]],
                                     link_preview=False)
         
         if data == 'admin_auto_trade_settings':
