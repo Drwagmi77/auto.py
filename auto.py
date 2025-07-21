@@ -13,8 +13,7 @@ from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
 from telethon.tl.functions.channels import GetParticipantRequest
 from flask import Flask, jsonify, request, redirect, session, render_template_string
 import threading
-import tweepy # X API için eklendi
-from datetime import datetime # İşlem geçmişi için eklendi
+# tweepy import'u kaldırıldı
 
 # Solana Kütüphaneleri
 from solana.rpc.api import Client, RPCException
@@ -25,6 +24,7 @@ from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+from datetime import datetime # İşlem geçmişi için eklendi
 
 # --- Ortam Değişkenleri ---
 # PostgreSQL Veritabanı Bilgileri
@@ -53,28 +53,13 @@ SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 JUPITER_API_URL = os.environ.get("JUPITER_API_URL", "https://quote-api.jup.ag/v6")
 
-# X (Twitter) API Bilgileri (İsteğe Bağlı - X paylaşımı varsayılan olarak kapalıdır)
-X_CONSUMER_KEY = os.environ.get("X_CONSUMER_KEY")
-X_CONSUMER_SECRET = os.environ.get("X_CONSUMER_SECRET")
-X_ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN")
-X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET")
+# X (Twitter) API Bilgileri kaldırıldı
 
 # Flask Uygulaması için Secret Key
 SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
-# --- X API Bağlantısı ---
-x_api = None
-if X_CONSUMER_KEY and X_CONSUMER_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET:
-    try:
-        auth = tweepy.OAuthHandler(X_CONSUMER_KEY, X_CONSUMER_SECRET)
-        auth.set_access_token(X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
-        x_api = tweepy.API(auth)
-        logger.info("X (Twitter) API initialized.")
-    except Exception as e:
-        logger.error(f"Error initializing X (Twitter) API: {e}")
-else:
-    logger.warning("X (Twitter) API credentials not fully set. X posting will be disabled.")
-
+# --- X API Bağlantısı kaldırıldı ---
+# x_api = None bloğu kaldırıldı
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -115,32 +100,8 @@ async def init_solana_client():
         solana_client = None
         payer_keypair = None
 
-# --- X paylaşım fonksiyonu ---
-async def post_to_x(message, media_url=None):
-    """Mesajı X (Twitter) platformunda paylaşır."""
-    if not x_api:
-        logger.warning("X API not initialized. Skipping X post.")
-        return
-
-    x_posting_enabled = await get_bot_setting("x_posting_enabled")
-    if x_posting_enabled != "enabled":
-        logger.info(f"X paylaşımı devre dışı, mesaj paylaşılmadı: {message[:100]}...")
-        return
-    try:
-        if len(message) > 280: # X karakter sınırı
-            message = message[:277] + "..."
-        if media_url:
-            response = requests.get(media_url)
-            response.raise_for_status()
-            media = response.content
-            x_api.update_status_with_media(status=message, filename="media.gif", file=media)
-        else:
-            x_api.update_status(status=message)
-        logger.info(f"X'te paylaşıldı: {message[:100]}...")
-    except tweepy.errors.TweepyException as e:
-        logger.error(f"X paylaşım hatası: {e}")
-    except Exception as e:
-        logger.error(f"Medya indirme veya X paylaşım hatası: {e}")
+# --- X paylaşım fonksiyonu kaldırıldı ---
+# async def post_to_x(message, media_url=None) fonksiyonu kaldırıldı
 
 # --- Veritabanı Bağlantı ve Yönetim Fonksiyonları (PostgreSQL) ---
 def get_connection():
@@ -485,7 +446,7 @@ async def get_transaction_history():
 DEFAULT_ADMIN_ID = int(os.environ.get("DEFAULT_ADMIN_ID", "YOUR_TELEGRAM_USER_ID")) 
 DEFAULT_BOT_SETTINGS = {
     "bot_status": "running",
-    "x_posting_enabled": "disabled", # X paylaşımı varsayılan olarak kapalı
+    # "x_posting_enabled": "disabled", # X paylaşımı varsayılan olarak kapalı - KALDIRILDI
     "auto_buy_enabled": "enabled",  # Otomatik alım varsayılan olarak AÇIK
     "buy_amount_sol": "0.05",        # Her alımda harcanacak SOL miktarı (0.05 SOL)
     "slippage_tolerance": "5",       # Kayma toleransı (%) (varsayılan 5%)
@@ -1190,7 +1151,8 @@ async def get_wallet_settings_dashboard():
         "💳 *Cüzdan Ayarları*\n\n"
         f"Aktif Cüzdan Public Key: `{wallet_pubkey}`\n"
         f"Bakiye: `{wallet_balance}`\n\n"
-        "⚠️ *Özel anahtarınızı girerken çok dikkatli olun! Bu anahtar botun cüzdanınıza tam erişimini sağlar.*"
+        "⚠️ *Özel anahtarınızı girerken çok dikkatli olun! Bu anahtar botun cüzdanınıza tam erişimini sağlar. "
+        "Yanlış veya kötü niyetli kullanımda fonlarınız risk altında olabilir.*"
     )
     return dashboard_text
 
