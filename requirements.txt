@@ -6,3 +6,4 @@ tweepy
 Flask[async]
 greenlet>=3.0.0
 solders==0.16.0
+httpx==0.26.0
