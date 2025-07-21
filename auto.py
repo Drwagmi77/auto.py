@@ -66,11 +66,15 @@ RPC_ENDPOINTS = [
     "https://solana-mainnet.rpc.extrnode.com"
 ]
 
+# Aktif RPC URL'sini tutmak için global değişken
+active_rpc_url = None
+
 async def get_healthy_client():
     """
     Önceden tanımlanmış bir listeden sağlıklı bir Solana RPC uç noktasına bağlanmaya çalışır.
     Başarılı olursa bir Client nesnesi, aksi takdirde None döndürür.
     """
+    global active_rpc_url
     for url in RPC_ENDPOINTS:
         try:
             logger.info(f"RPC URL test ediliyor: {url}")
@@ -83,12 +87,14 @@ async def get_healthy_client():
             # GetBlockHeightResp nesnesini ve değerini kontrol et
             if isinstance(block_height_resp, GetBlockHeightResp) and block_height_resp.value is not None and block_height_resp.value > 0:
                 logger.info(f"Sağlıklı RPC'ye bağlandı: {url}. Blok yüksekliği: {block_height_resp.value}")
+                active_rpc_url = url # Aktif URL'yi kaydet
                 return client
             else:
                 logger.warning(f"RPC {url} sağlıksız görünüyor veya geçersiz blok yüksekliği döndürdü: {block_height_resp}")
         except Exception as e:
             logger.warning(f"RPC {url} bağlantısı başarısız: {str(e)}")
     logger.error("Tüm RPC uç noktaları başarısız oldu.")
+    active_rpc_url = None # Sağlıklı RPC bulunamadı
     return None
 
 async def get_balance_with_retry(pubkey: Pubkey, retries=3):
@@ -152,7 +158,8 @@ async def init_solana_client():
         try:
             payer_keypair = Keypair.from_base58_string(priv_key)
             logger.info(f"Cüzdan başlatıldı: {payer_keypair.pubkey()}")
-            logger.info(f"Aktif RPC URL'si: {solana_client.endpoint_uri}")
+            # active_rpc_url değişkenini kullanarak loglama yapıldı
+            logger.info(f"Aktif RPC URL'si: {active_rpc_url if active_rpc_url else 'Bilinmiyor'}") 
 
             # Bakiye kontrolü
             balance = await check_wallet_balance()
@@ -1027,7 +1034,7 @@ async def admin_callback_handler(event):
             pending_input[uid] = {'action': 'set_profit_target'}
             kb = [[Button.inline("🔙 Geri", b"admin_auto_trade_settings")]]
             current_target = await get_bot_setting("profit_target_x")
-            return await event.edit(f"📈 *Kar Hedefini Ayarla*\n\nMevcut hedef: `{current_target}x`\n\nSatıştan önce token fiyatının kaç kat artması gerektiğini girin (örn. 2x için `2.0`, 5x için `5.0`):",
+            return await event.edit(f"� *Kar Hedefini Ayarla*\n\nMevcut hedef: `{current_target}x`\n\nSatıştan önce token fiyatının kaç kat artması gerektiğini girin (örn. 2x için `2.0`, 5x için `5.0`):",
                                     buttons=kb, link_preview=False)
         if data == 'admin_set_stop_loss':
             pending_input[uid] = {'action': 'set_stop_loss'}
@@ -1118,7 +1125,7 @@ async def admin_callback_handler(event):
                     history_text += "\n"
             
             kb = [[Button.inline("🔙 Geri", b"admin_home")]]
-            return await event.edit(history_text, buttons=kb, parse_mode='md', link_preview=False)
+            return await event.edit(history_text, buttons=kb, parse_preview=False) # link_preview=False yerine parse_preview=False kullanıldı
 
         await event.answer("Bilinmeyen eylem.")
 
